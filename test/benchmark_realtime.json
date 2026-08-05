@@ -1,0 +1,75 @@
+{
+  "mode": "realtime_camera",
+  "total_elapsed": 72.3,
+  "sizes": {
+    "full": {
+      "resolution": "full",
+      "total_frames": 42,
+      "avg_inference_ms": 309.64,
+      "std_inference_ms": 220.08,
+      "min_inference_ms": 238.17,
+      "max_inference_ms": 1708.22,
+      "avg_fps": 3.23,
+      "avg_nav_points": 0.0,
+      "avg_drivable_px": 0.0,
+      "go_percent": 0.0,
+      "timeline_ms": [
+        1708.2,
+        293.1,
+        306.2,
+        290.1,
+        289.2,
+        298.2,
+        255.6,
+        238.2,
+        305.7
+      ]
+    },
+    "medium": {
+      "resolution": "620x690",
+      "total_frames": 42,
+      "avg_inference_ms": 71.38,
+      "std_inference_ms": 15.88,
+      "min_inference_ms": 64.45,
+      "max_inference_ms": 166.74,
+      "avg_fps": 14.01,
+      "avg_nav_points": 1.19,
+      "avg_drivable_px": 71.2,
+      "go_percent": 0.0,
+      "timeline_ms": [
+        166.7,
+        68.7,
+        67.2,
+        68.0,
+        67.4,
+        88.4,
+        80.2,
+        66.3,
+        66.6
+      ]
+    },
+    "small": {
+      "resolution": "416x416",
+      "total_frames": 41,
+      "avg_inference_ms": 42.72,
+      "std_inference_ms": 12.66,
+      "min_inference_ms": 36.7,
+      "max_inference_ms": 120.54,
+      "avg_fps": 23.41,
+      "avg_nav_points": 1.29,
+      "avg_drivable_px": 10.6,
+      "go_percent": 0.0,
+      "timeline_ms": [
+        120.5,
+        44.5,
+        38.8,
+        49.0,
+        41.1,
+        39.7,
+        44.6,
+        37.1,
+        37.1
+      ]
+    }
+  }
+}
