@@ -573,6 +573,7 @@ python saty5.py \
     --save_output \
     --output zoo22 \
     --min_nav_path_points 50 \
+    เพิ่มเติม
     --straight_path_bias 1.5 \ #ใช้เพิ่มน้ำหนักให้ path อยู่ใกล้แนวกลางรถมากขึ้น ยิ่งค่าสูงยิ่งเลือกทางตรงมากขึ้น
     --nav_corridor_width 180 \ #ถ้าตั้งค่ามากกว่า 0 จะกรองเฉพาะพื้นที่ใน corridor กลางรถก่อนเลือก path
     --nav_path_offset_px -40 \ #ค่าลบ = ชิดซ้าย, ค่าบวก = ชิดขวา
