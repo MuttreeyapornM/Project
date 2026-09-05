@@ -41,6 +41,12 @@ if [ "$current_branch" != "$BRANCH" ]; then
   git_auto checkout -B "$BRANCH"
 fi
 
+remote_branch_exists=0
+if git_auto ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  remote_branch_exists=1
+  git_auto fetch origin "$BRANCH"
+fi
+
 git_auto add -A
 
 if git_auto diff --cached --quiet; then
@@ -56,15 +62,25 @@ if [ "$(git_auto rev-list --count HEAD 2>/dev/null || echo 0)" -eq 0 ]; then
   exit 0
 fi
 
-if git_auto rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
-  if [ "$(git_auto rev-list --count "origin/$BRANCH..HEAD")" -eq 0 ]; then
+if [ "$remote_branch_exists" -eq 1 ] && git_auto rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+  remote_ahead="$(git_auto rev-list --count "HEAD..origin/$BRANCH")"
+  local_ahead="$(git_auto rev-list --count "origin/$BRANCH..HEAD")"
+
+  if [ "$remote_ahead" -gt 0 ]; then
+    if ! git_auto pull --rebase origin "$BRANCH"; then
+      log "pull/rebase failed; resolve conflicts manually"
+      exit 1
+    fi
+    log "pulled updates from origin/$BRANCH"
+    git_auto fetch origin "$BRANCH"
+    remote_ahead="$(git_auto rev-list --count "HEAD..origin/$BRANCH")"
+    local_ahead="$(git_auto rev-list --count "origin/$BRANCH..HEAD")"
+  fi
+
+  if [ "$local_ahead" -eq 0 ] && [ "$remote_ahead" -eq 0 ]; then
     log "no commits to push"
     exit 0
   fi
-fi
-
-if git_auto ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-  git_auto pull --rebase origin "$BRANCH"
 fi
 
 if ! git_auto push -u origin "$BRANCH"; then
