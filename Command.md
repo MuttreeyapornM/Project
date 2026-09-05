@@ -677,7 +677,7 @@ source /opt/rps/foxy/set.bash
     --stats_every 5 \
     --show_preview
 
-    python saty5.py \
+    python saty4.py \
     --front_cam 0 \
     --left_cam 4 \
     --rear_cam 2 \
