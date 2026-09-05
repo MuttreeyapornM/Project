@@ -194,126 +194,40 @@ class ImageStitcher:
         return G, overlapMask
 
 
-    # ------------------------------------------------------------------
-    # Blend-weight cache.
-    #
-    # G depends only on WHERE the two warped views overlap. That is fixed by
-    # the camera mounting and the homographies, so it is identical on every
-    # frame. The original recomputed it per frame, including two
-    # cv2.distanceTransform calls per corner -- eight per BEV frame on
-    # 565x565 regions. Measured on the Jetson AGX Xavier, the whole stitch
-    # cost ~88 ms/frame, about 65% of the remaining BEV frame time once the
-    # remap-LUT patch was in.
-    #
-    # Weights are now computed once per corner and reused.
-    #
-    # IMPORTANT: call ImageStitcher.reset_weights() if the cameras are moved
-    # or the homographies are recalibrated. Otherwise the cached weights
-    # describe the old geometry and the seams will be wrong.
-    # ------------------------------------------------------------------
-    _weight_cache = {}
-
-    @staticmethod
-    def reset_weights():
-        """Drop the cached blend weights. Call after any recalibration."""
-        ImageStitcher._weight_cache.clear()
-
-    @staticmethod
-    def cached_corners():
-        """Which corners currently have cached weights (for diagnostics)."""
-        return sorted(ImageStitcher._weight_cache)
-
-    @staticmethod
-    def _validity_mask(img):
-        """Which output pixels this warped view actually covers.
-
-        Uses any-channel-non-zero and closes small holes, rather than
-        cvtColor + threshold. The mask is meant to describe the GEOMETRIC
-        footprint of the warp, so a genuinely black pixel in the scene must
-        not punch a hole in it -- which is what the original get_mask() did,
-        since a black pixel is indistinguishable from an uncovered one after
-        a greyscale threshold at 0.
-        """
-        m = (img.max(axis=2) > 0).astype(np.uint8) * 255
-        return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-
-    @staticmethod
-    def get_weight_mask_matrix_liverun(imA, imB, dist_threshold=5, key=None):
-        """Blend weights for one overlapping corner.
-
-        Pass `key` (a stable name for the corner) to enable caching. Without a
-        key the weights are recomputed, which preserves the original
-        behaviour for any caller that relies on it.
-        """
-        if key is not None:
-            hit = ImageStitcher._weight_cache.get(key)
-            if hit is not None:
-                return hit[0], hit[1]
-
-        maskA = ImageStitcher._validity_mask(imA)
-        maskB = ImageStitcher._validity_mask(imB)
-
-        # Where both views cover the same output pixel. The original took a
-        # bitwise AND of the two images' PIXEL VALUES, which is not an overlap
-        # test -- two valid pixels whose colour bits happen not to intersect
-        # (e.g. 0x0F and 0xF0) AND to zero and drop out of the overlap.
-        overlapMask = cv2.dilate(
-            cv2.bitwise_and(maskA, maskB), np.ones((2, 2), np.uint8), iterations=2
-        )
+    def get_weight_mask_matrix_liverun(imA, imB, dist_threshold=5):
+        overlapMask = ImageStitcher.get_overlap_region_mask(imA, imB)
         overlapMaskInv = cv2.bitwise_not(overlapMask)
+        
+        # Difference masks
+        imA_diff = cv2.bitwise_and(imA, imA, mask=overlapMaskInv)
+        imB_diff = cv2.bitwise_and(imB, imB, mask=overlapMaskInv)
 
-        # Each view's exclusive region: covered by it, outside the overlap.
-        polyA_mask = cv2.bitwise_and(maskA, overlapMaskInv)
-        polyB_mask = cv2.bitwise_and(maskB, overlapMaskInv)
+        # Binary masks for distance transform
+        polyA_mask = ImageStitcher.get_mask(imA_diff)
+        polyB_mask = ImageStitcher.get_mask(imB_diff)
 
-        distToA = cv2.distanceTransform(255 - polyA_mask, cv2.DIST_L2, 5)
+        # Compute Distance Transform
+        distToA = cv2.distanceTransform(255 - polyA_mask, cv2.DIST_L2, 5)  # DIST_L2 = Euclidean distance
         distToB = cv2.distanceTransform(255 - polyB_mask, cv2.DIST_L2, 5)
+
+        # Square the distances
         distToA **= 2
         distToB **= 2
 
-        G = maskA.astype(np.float32) / 255.0
-        denominator = distToA + distToB
-        nz = denominator > 0
-        G[nz] = distToB[nz] / denominator[nz]
+        # Initialize weight matrix G
+        G = ImageStitcher.get_mask(imA).astype(np.float32) / 255.0
 
-        if key is not None:
-            # Cache the blend weights as FIXED POINT, pre-expanded to 3 channels.
-            #
-            # The float32 merge cost 10.5 ms per corner (42 ms/frame over four)
-            # because it converted both crops to float32, did two float
-            # multiplies and an add, then converted back -- six full-array
-            # passes. In 7-bit fixed point the whole blend stays in uint16:
-            # 255*128 + 255*128 = 65280 < 65535, so it cannot overflow, and one
-            # right shift replaces the final conversion.
-            #
-            # Measured 1.38 ms per corner, 7.6x faster, with a maximum
-            # difference of 1 intensity level against the float32 result and
-            # nothing differing by more than 1.
-            Gq = np.clip(np.round(G * ImageStitcher.BLEND_Q), 0,
-                         ImageStitcher.BLEND_Q).astype(np.uint16)
-            Gq = np.repeat(Gq[:, :, None], 3, axis=2)
-            GqB = (ImageStitcher.BLEND_Q - Gq).astype(np.uint16)
-            ImageStitcher._weight_cache[key] = (G, overlapMask, Gq, GqB)
+        # Avoid division by zero
+        denominator = distToA + distToB
+        mask = denominator > 0  # จุดที่มีค่า denominator ไม่เป็น 0
+        G[mask] = distToB[mask] / denominator[mask]
 
         return G, overlapMask
 
 
 
-    # Fixed-point blend scale. 128 keeps the whole accumulation inside uint16.
-    BLEND_Q = 128
-    BLEND_SHIFT = 7
-
     @staticmethod
-    def merge(imA, imB, G, key=None):
-        """Blend two crops. With `key`, uses the cached fixed-point weights."""
-        if key is not None:
-            hit = ImageStitcher._weight_cache.get(key)
-            if hit is not None and len(hit) == 4:
-                Gq, GqB = hit[2], hit[3]
-                return (
-                    (imA.astype(np.uint16) * Gq + imB.astype(np.uint16) * GqB)
-                    >> ImageStitcher.BLEND_SHIFT
-                ).astype(np.uint8)
+    def merge(imA, imB, G):
         G_expanded = np.expand_dims(G, axis=-1)
         return (imA * G_expanded + imB * (1 - G_expanded)).astype(np.uint8)
 
@@ -444,20 +358,20 @@ class ImageStitcher:
 
 
         # รวมภาพซ้ายบน
-        G0, M0 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.FI(front), ImageStitcher.LI(left), key="LT")
-        merged_image_LT = ImageStitcher.merge(ImageStitcher.FI(front), ImageStitcher.LI(left), G0, key="LT")
+        G0, M0 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.FI(front), ImageStitcher.LI(left))
+        merged_image_LT = ImageStitcher.merge(ImageStitcher.FI(front), ImageStitcher.LI(left), G0)
 
         # รวมภาพขวาบน
-        G1, M1 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.FII(front), ImageStitcher.RII(right), key="RT")
-        merged_image_RT = ImageStitcher.merge(ImageStitcher.FII(front), ImageStitcher.RII(right), G1, key="RT")
+        G1, M1 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.FII(front), ImageStitcher.RII(right))
+        merged_image_RT = ImageStitcher.merge(ImageStitcher.FII(front), ImageStitcher.RII(right), G1)
 
         # รวมภาพซ้ายล่าง
-        G2, M2 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.BIII(back), ImageStitcher.LIII(left), key="LB")
-        merged_image_LB = ImageStitcher.merge(ImageStitcher.BIII(back), ImageStitcher.LIII(left), G2, key="LB")
+        G2, M2 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.BIII(back), ImageStitcher.LIII(left))
+        merged_image_LB = ImageStitcher.merge(ImageStitcher.BIII(back), ImageStitcher.LIII(left), G2)
 
         # รวมภาพขวาล่าง
-        G3, M3 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.BIV(back), ImageStitcher.RIV(right), key="RB")
-        merged_image_RB = ImageStitcher.merge(ImageStitcher.BIV(back), ImageStitcher.RIV(right), G3, key="RB")
+        G3, M3 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.BIV(back), ImageStitcher.RIV(right))
+        merged_image_RB = ImageStitcher.merge(ImageStitcher.BIV(back), ImageStitcher.RIV(right), G3)
 
         # บรรจุภาพที่ไม่ได้ merge (FM, BM, LM, RM)
         final_merged_image = np.zeros_like(front)

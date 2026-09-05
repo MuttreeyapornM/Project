@@ -79,42 +79,6 @@ else:
     String = None
 
 
-# ---------------------------------------------------------------------------
-# /cmd_vel contract.
-#
-# Two different consumers read this topic and they disagree about what
-# angular.z means:
-#
-#   "steering_angle" (legacy)  Munkong's steering_node.py reads angular.z as a
-#                              STEERING ANGLE in radians and drives the motor
-#                              with it directly.
-#   "yaw_rate"                 The professor's ros_can_bridge reads angular.z as
-#                              a YAW RATE in rad/s and converts it with a bicycle
-#                              model, delta = atan(wheelbase * yaw_rate / v). It
-#                              also reads linear.x in METRES PER SECOND, capped
-#                              at max_speed_mps.
-#
-# Publishing a steering angle to the bridge makes the cart steer the wrong
-# amount, and the error grows with speed: a 30 deg command becomes 40.8 deg at
-# 1 m/s, 23.4 at 2 m/s, 16.1 at 3 m/s and 9.8 at 5 m/s.
-#
-# Default is "steering_angle" so behaviour is unchanged until the contract is
-# chosen deliberately. Switch to "yaw_rate" ONLY when the professor's
-# ros_can_bridge is the consumer, and bench-test with the wheels off the ground
-# before driving.
-# ---------------------------------------------------------------------------
-CMD_VEL_CONTRACTS = ("steering_angle", "yaw_rate")
-DEFAULT_CMD_VEL_CONTRACT = "steering_angle"
-# In "yaw_rate" mode the planner's normalised 0..1 throttle is scaled to m/s by
-# this. 1.0 keeps the same top speed the legacy mode produced, since the bridge
-# already read the old 0..1 value as m/s.
-DEFAULT_MAX_SPEED_MPS = 1.0
-# nav_processing.WHEELBASE is 1.67; the professor's golfcart_low_level.yaml has
-# wheelbase_m: 1.65, measured on the real vehicle. Used for the yaw-rate
-# conversion only, so nav_processing's steering geometry is left alone.
-DEFAULT_WHEELBASE_M = 1.65
-
-
 class CombinedVehicleControllerNode(Node):
     def __init__(
         self,
@@ -149,34 +113,6 @@ class CombinedVehicleControllerNode(Node):
                 "steering_max_rate_deg_s", DEFAULT_STEERING_MAX_RATE_DEG_S
             )
         )
-        contract = str(
-            self.config.get("cmd_vel_contract", DEFAULT_CMD_VEL_CONTRACT)
-        ).strip().lower()
-        if contract not in CMD_VEL_CONTRACTS:
-            raise ValueError(
-                f"cmd_vel_contract must be one of {CMD_VEL_CONTRACTS}, got {contract!r}"
-            )
-        self.cmd_vel_contract = contract
-        self.max_speed_mps = max(
-            0.0, float(self.config.get("max_speed_mps", DEFAULT_MAX_SPEED_MPS))
-        )
-        self.wheelbase_m = float(
-            self.config.get("wheelbase_m", DEFAULT_WHEELBASE_M)
-        )
-        if self.cmd_vel_contract == "yaw_rate":
-            self.get_logger().info(
-                f"/cmd_vel contract: yaw_rate -- linear.x in m/s "
-                f"(max {self.max_speed_mps:.2f}), angular.z = yaw rate rad/s, "
-                f"wheelbase {self.wheelbase_m:.3f} m"
-            )
-        else:
-            self.get_logger().warning(
-                "/cmd_vel contract: steering_angle (legacy) -- angular.z carries a "
-                "STEERING ANGLE in radians. Correct for Munkong's steering_node.py. "
-                "WRONG for the professor's ros_can_bridge, which reads angular.z as a "
-                "yaw rate: the cart will steer the wrong amount and the error grows "
-                "with speed. Pass --cmd_vel_contract yaw_rate for that stack."
-            )
         self.last_filtered_steering_deg = None
         self.last_filter_time = None
         self.cmd_vel_publish_hz = max(float(cmd_vel_publish_hz), 1.0)
@@ -216,22 +152,9 @@ class CombinedVehicleControllerNode(Node):
             steering_angle_deg, linear_x
         )
         cmd = Twist()
-        # the planner produces linear_x as a normalised 0..1 throttle
-        throttle = float(linear_x)
-        throttle = 0.0 if throttle < 0.0 else 1.0 if throttle > 1.0 else throttle
-        delta_rad = math.radians(steering_angle_deg)
-        if self.cmd_vel_contract == "yaw_rate":
-            speed_mps = throttle * self.max_speed_mps
-            cmd.linear.x = speed_mps
-            # invert the bridge's delta = atan(L * z / v)
-            cmd.angular.z = (
-                speed_mps * math.tan(delta_rad) / self.wheelbase_m
-                if speed_mps > 0.0
-                else 0.0
-            )
-        else:
-            cmd.linear.x = throttle
-            cmd.angular.z = delta_rad
+        linear_x = float(linear_x)
+        cmd.linear.x = 0.0 if linear_x < 0.0 else 1.0 if linear_x > 1.0 else linear_x
+        cmd.angular.z = math.radians(steering_angle_deg)
         now = time.time()
         with self.cmd_lock:
             self.latest_cmd = cmd
@@ -540,33 +463,6 @@ def get_argparser():
         type=float,
         default=DEFAULT_CURVED_LINEAR_X,
         help="linear.x command when the spline is more curved",
-    )
-    parser.add_argument(
-        "--stats_every",
-        type=float,
-        default=5.0,
-        help="seconds between timing/FPS reports; 0 disables",
-    )
-    parser.add_argument(
-        "--cmd_vel_contract",
-        type=str,
-        default=DEFAULT_CMD_VEL_CONTRACT,
-        choices=list(CMD_VEL_CONTRACTS),
-        help="how the /cmd_vel consumer reads angular.z: 'steering_angle' "
-             "(Munkong's steering_node.py) or 'yaw_rate' (the professor's "
-             "ros_can_bridge)",
-    )
-    parser.add_argument(
-        "--max_speed_mps",
-        type=float,
-        default=DEFAULT_MAX_SPEED_MPS,
-        help="yaw_rate mode only: m/s corresponding to full throttle",
-    )
-    parser.add_argument(
-        "--wheelbase_m",
-        type=float,
-        default=DEFAULT_WHEELBASE_M,
-        help="yaw_rate mode only: wheelbase for the bicycle conversion",
     )
     parser.add_argument(
         "--drivable_class_ids",
@@ -888,45 +784,6 @@ def split_contiguous_runs(xs):
     return np.split(xs, breaks)
 
 
-def _row_runs(mask, top_y, bottom_y):
-    """Run-length encode every row of mask[top_y:bottom_y+1] in ONE pass.
-
-    Returns {y: [(left, right), ...]} with runs left-to-right.
-
-    The previous code did np.where + np.diff + np.where + np.split PER ROW --
-    about 690 rows and ~2700 numpy calls per frame, where the call overhead
-    dwarfed the work (profiled at 68.5 ms/frame, more than the segmentation
-    network itself). Only run[0] and run[-1] were ever used, so the split
-    arrays were never needed at all.
-    """
-    sub = mask[top_y:bottom_y + 1, :] > 0
-    h, w = sub.shape
-    padded = np.zeros((h, w + 2), dtype=np.int8)
-    padded[:, 1:-1] = sub
-    d = np.diff(padded, axis=1)
-    sy, sx = np.nonzero(d == 1)     # run starts: column index in sub
-    ey, ex = np.nonzero(d == -1)    # run ends:   column index + 1 in sub
-    out = {}
-    if sy.size:
-        # np.nonzero returns row-major order, so runs are already grouped by row
-        # and ordered left-to-right within each row.
-        bounds = np.searchsorted(sy, np.arange(h + 1))
-        sx_l = sx.tolist()
-        ex_l = (ex - 1).tolist()
-        bl = bounds.tolist()
-        for i in range(h):
-            a, b = bl[i], bl[i + 1]
-            if a != b:
-                out[top_y + i] = list(zip(sx_l[a:b], ex_l[a:b]))
-    return out
-
-
-def _distance_to_run(x, left, right):
-    if left <= x <= right:
-        return 0.0
-    return float(min(abs(x - left), abs(x - right)))
-
-
 def build_tracked_nav_points(
     mask,
     vehicle_center,
@@ -936,56 +793,59 @@ def build_tracked_nav_points(
     nav_path_lateral_ratio=DEFAULT_NAV_PATH_LATERAL_RATIO,
 ):
     height, width = mask.shape
-    start_x = int(min(max(vehicle_center[0], 0), width - 1))
-    start_y = int(min(max(vehicle_center[1], 0), height - 1))
+    start_x = int(np.clip(vehicle_center[0], 0, width - 1))
+    start_y = int(np.clip(vehicle_center[1], 0, height - 1))
     straight_x = start_x
     straight_path_bias = max(0.0, float(straight_path_bias))
     nav_corridor_width = max(0, int(nav_corridor_width))
     nav_path_offset_px = int(nav_path_offset_px)
-    nav_path_lateral_ratio = float(min(max(nav_path_lateral_ratio, -1.0), 1.0))
+    nav_path_lateral_ratio = float(
+        np.clip(nav_path_lateral_ratio, -1.0, 1.0)
+    )
     corridor_half_width = nav_corridor_width // 2
-
-    runs_by_row = _row_runs(mask, 0, start_y)
 
     nav_points = []
     current_x = start_x
 
-    if corridor_half_width > 0:
-        corridor_left = max(0, straight_x - corridor_half_width)
-        corridor_right = min(width - 1, straight_x + corridor_half_width)
-
     # At junctions, prefer the run that stays continuous and close to straight ahead.
     for y in range(start_y, -1, -1):
-        runs = runs_by_row.get(y)
+        xs = np.where(mask[y, :] > 0)[0]
+        runs = split_contiguous_runs(xs)
         if not runs:
             continue
 
         if corridor_half_width > 0:
+            corridor_left = max(0, straight_x - corridor_half_width)
+            corridor_right = min(width - 1, straight_x + corridor_half_width)
             corridor_runs = [
-                run for run in runs
-                if run[1] >= corridor_left and run[0] <= corridor_right
+                run
+                for run in runs
+                if int(run[-1]) >= corridor_left and int(run[0]) <= corridor_right
             ]
             if corridor_runs:
                 runs = corridor_runs
 
-        if len(runs) == 1:
-            left, right = runs[0]
-        else:
-            best = None
-            for left_c, right_c in runs:
-                score = (_distance_to_run(current_x, left_c, right_c)
-                         + straight_path_bias
-                         * _distance_to_run(straight_x, left_c, right_c))
-                if best is None or score < best[0]:
-                    best = (score, left_c, right_c)
-            _, left, right = best
+        def distance_to_run(x, left, right):
+            if left <= x <= right:
+                return 0.0
+            return float(min(abs(x - left), abs(x - right)))
 
+        def run_score(run):
+            left = int(run[0])
+            right = int(run[-1])
+            continuity_error = distance_to_run(current_x, left, right)
+            straight_error = distance_to_run(straight_x, left, right)
+            return continuity_error + straight_path_bias * straight_error
+
+        selected_run = min(runs, key=run_score)
+        left = int(selected_run[0])
+        right = int(selected_run[-1])
         preferred_x = (
             current_x + straight_path_bias * straight_x
         ) / (1.0 + straight_path_bias)
         run_half_width = max(0.0, (right - left) / 2.0)
         offset_x = nav_path_offset_px + nav_path_lateral_ratio * run_half_width
-        current_x = int(min(max(round(preferred_x + offset_x), left), right))
+        current_x = int(np.clip(round(preferred_x + offset_x), left, right))
         nav_points.append((current_x, y))
 
     return nav_points
@@ -1330,9 +1190,6 @@ def main():
                 "steering_filter_alpha": opts.steering_filter_alpha,
                 "steering_deadband_deg": opts.steering_deadband_deg,
                 "steering_max_rate_deg_s": opts.steering_max_rate_deg_s,
-                "cmd_vel_contract": opts.cmd_vel_contract,
-                "max_speed_mps": opts.max_speed_mps,
-                "wheelbase_m": opts.wheelbase_m,
             },
             cmd_vel_publish_hz=opts.cmd_vel_publish_hz,
         )
@@ -1413,35 +1270,9 @@ def main():
     record_every = max(opts.record_every, 1)
     save_image_interval = max(opts.save_image_interval, 1)
 
-    # A camera that fails to open is otherwise silent: grab_frame() returns
-    # False, get_bev_frame() returns (None, None) forever, and the loop spins at
-    # full CPU producing nothing. Check once, up front, and say which one.
-    dead = [cid for cid, cap in bev_processor.caps.items() if not cap.isOpened()]
-    if dead:
-        present = sorted(
-            int(p.rsplit("video", 1)[1])
-            for p in __import__("glob").glob("/dev/video*")
-            if p.rsplit("video", 1)[1].isdigit()
-        )
-        raise SystemExit(
-            f"camera(s) failed to open: {', '.join(dead)}\n"
-            f"  requested indices: front={opts.front_cam} left={opts.left_cam} "
-            f"rear={opts.rear_cam} right={opts.right_cam}\n"
-            f"  /dev/video* present: {present}\n"
-            f"  check with: v4l2-ctl --list-devices"
-        )
-
-    # --- timing ---------------------------------------------------------
-    stats_every = float(opts.stats_every)
-    st = {"wait": 0.0, "process": 0.0, "record": 0.0, "preview": 0.0, "loop": 0.0}
-    st_n = 0
-    st_t0 = time.perf_counter()
-    st_bev0 = capture_worker.latest_id if capture_worker is not None else 0
-
     try:
         while True:
             t_start = time.time()
-            _t = time.perf_counter()
             if capture_worker is not None:
                 bev_frame, cam_display, last_capture_id = capture_worker.get_latest(
                     last_capture_id
@@ -1450,12 +1281,10 @@ def main():
                 bev_frame, cam_display = bev_processor.get_bev_frame(
                     include_display=opts.show_preview
                 )
-            st["wait"] += (time.perf_counter() - _t) * 1000.0
             if bev_frame is None:
                 time.sleep(0.01)
                 continue
 
-            _t = time.perf_counter()
             result, _, _, _, _ = process_frame(
                 bev_frame,
                 model,
@@ -1480,9 +1309,6 @@ def main():
                 nav_path_offset_px=opts.nav_path_offset_px,
                 nav_path_lateral_ratio=opts.nav_path_lateral_ratio,
             )
-
-            st["process"] += (time.perf_counter() - _t) * 1000.0
-            _t = time.perf_counter()
 
             if opts.save_output and frame_count % record_every == 0:
                 if overlay_writer is None:
@@ -1522,10 +1348,10 @@ def main():
                     result,
                 )
 
-            st["record"] += (time.perf_counter() - _t) * 1000.0
             frame_count += 1
+            if frame_count % 30 == 0:
+                print(f"Processed {frame_count} frames")
 
-            _t = time.perf_counter()
             if opts.show_preview:
                 h_r, w_r = result.shape[:2]
                 cv2.imshow(
@@ -1540,33 +1366,6 @@ def main():
                     )
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
-            st["preview"] += (time.perf_counter() - _t) * 1000.0
-            st_n += 1
-
-            if stats_every > 0:
-                _el = time.perf_counter() - st_t0
-                if _el >= stats_every:
-                    n = max(st_n, 1)
-                    loop_ms = _el * 1000.0 / n
-                    line = (
-                        f"[stats] {n / _el:5.2f} FPS  loop {loop_ms:6.1f} ms  |  "
-                        f"wait {st['wait'] / n:6.1f}  "
-                        f"process {st['process'] / n:6.1f}  "
-                        f"record {st['record'] / n:5.1f}  "
-                        f"preview {st['preview'] / n:5.1f} ms"
-                    )
-                    if capture_worker is not None:
-                        produced = capture_worker.latest_id - st_bev0
-                        line += (
-                            f"  |  BEV produced {produced / _el:5.2f}/s, "
-                            f"consumed {n / _el:5.2f}/s "
-                            + ("(compute-bound)" if produced > n * 1.2 else "(capture-bound)")
-                        )
-                        st_bev0 = capture_worker.latest_id
-                    print(line, flush=True)
-                    st = {k: 0.0 for k in st}
-                    st_n = 0
-                    st_t0 = time.perf_counter()
 
             elapsed = time.time() - t_start
             time.sleep(max(0.0, interval - elapsed))

@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 
+.git-auto/
+auto-git-sync.log
+.auto-git-sync.lock
+
 venv/
 .venv/
 

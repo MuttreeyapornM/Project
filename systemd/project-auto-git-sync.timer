@@ -1,0 +1,10 @@
+[Unit]
+Description=Run project GitHub auto-sync every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=project-auto-git-sync.service
+
+[Install]
+WantedBy=timers.target

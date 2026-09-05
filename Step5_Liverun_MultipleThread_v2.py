@@ -146,10 +146,14 @@ if __name__ == '__main__':
 
 # สำหรับโฟลเดอร์รูปภาพ Dataset/cameras
     video_paths = {
-      "front": "Dataset/cameras/front",
-      "left": "Dataset/cameras/left",
-      "rear": "Dataset/cameras/rear",
-      "right": "Dataset/cameras/right",
+    #   "front": "Dataset/camerasN/front",
+    #   "left": "Dataset/camerasN/left",
+    #   "rear": "Dataset/camerasN/rear",
+    #   "right": "Dataset/camerasN/right",
+      "front": "Dataset/liverun_indoor/front",
+      "left": "Dataset/liverun_indoor/left",
+      "rear": "Dataset/liverun_indoor/rear",
+      "right": "Dataset/liverun_indoor/right",
     }
     processor = ImageProcessor(video_paths, img_car)
     processor.run()

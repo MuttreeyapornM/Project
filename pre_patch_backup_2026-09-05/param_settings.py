@@ -29,30 +29,11 @@ inn_shift_h = 45
 top_left_x = shift_w + Cal_size_w + inn_shift_w                 
 top_left_y = shift_h + Cal_size_h + inn_shift_h                  
 
-# --- Car overlay placement -------------------------------------------------
-# Car_size_w/h describe the VEHICLE (1.10 x 2.50 m). The region no camera can
-# see is larger than that and is not centred on it: measured from the live
-# warps on 2026-09-05 the blind zone is x 511-723, y 536-858, i.e.
-# 2.12 x 3.22 m, offset dx-54 dy-29 from the car rectangle.
-#
-# Drawing the car image only over Car_size leaves a black ring around it.
-# CAR_OVERLAY_BOX places the overlay over the full blind zone instead.
-# This affects ONLY ImageAdjuster.overlay_image_perspective(). It does NOT
-# touch xl/xr/yt/yb, which define the stitch section crops, so the homographies
-# stay valid. Set CAR_OVERLAY_BOX = None to restore the old behaviour.
-CAR_OVERLAY_BOX = (511, 536, 723, 858)   # x0, y0, x1, y1 in canvas px
-
-if CAR_OVERLAY_BOX is None:
-    _cx0, _cy0 = top_left_x, top_left_y
-    _cx1, _cy1 = top_left_x + Car_size_w, top_left_y + Car_size_h
-else:
-    _cx0, _cy0, _cx1, _cy1 = CAR_OVERLAY_BOX
-
 Car_dst_points = np.float32([
-    [_cx0, _cy0],
-    [_cx1, _cy0],
-    [_cx0, _cy1],
-    [_cx1, _cy1],
+    [top_left_x, top_left_y],                                     
+    [top_left_x + Car_size_w, top_left_y],                        
+    [top_left_x, top_left_y + Car_size_h],                        
+    [top_left_x + Car_size_w, top_left_y + Car_size_h]            
 ])
 # --------------------------------------------------------------------
 

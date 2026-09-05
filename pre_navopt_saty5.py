@@ -888,45 +888,6 @@ def split_contiguous_runs(xs):
     return np.split(xs, breaks)
 
 
-def _row_runs(mask, top_y, bottom_y):
-    """Run-length encode every row of mask[top_y:bottom_y+1] in ONE pass.
-
-    Returns {y: [(left, right), ...]} with runs left-to-right.
-
-    The previous code did np.where + np.diff + np.where + np.split PER ROW --
-    about 690 rows and ~2700 numpy calls per frame, where the call overhead
-    dwarfed the work (profiled at 68.5 ms/frame, more than the segmentation
-    network itself). Only run[0] and run[-1] were ever used, so the split
-    arrays were never needed at all.
-    """
-    sub = mask[top_y:bottom_y + 1, :] > 0
-    h, w = sub.shape
-    padded = np.zeros((h, w + 2), dtype=np.int8)
-    padded[:, 1:-1] = sub
-    d = np.diff(padded, axis=1)
-    sy, sx = np.nonzero(d == 1)     # run starts: column index in sub
-    ey, ex = np.nonzero(d == -1)    # run ends:   column index + 1 in sub
-    out = {}
-    if sy.size:
-        # np.nonzero returns row-major order, so runs are already grouped by row
-        # and ordered left-to-right within each row.
-        bounds = np.searchsorted(sy, np.arange(h + 1))
-        sx_l = sx.tolist()
-        ex_l = (ex - 1).tolist()
-        bl = bounds.tolist()
-        for i in range(h):
-            a, b = bl[i], bl[i + 1]
-            if a != b:
-                out[top_y + i] = list(zip(sx_l[a:b], ex_l[a:b]))
-    return out
-
-
-def _distance_to_run(x, left, right):
-    if left <= x <= right:
-        return 0.0
-    return float(min(abs(x - left), abs(x - right)))
-
-
 def build_tracked_nav_points(
     mask,
     vehicle_center,
@@ -936,56 +897,59 @@ def build_tracked_nav_points(
     nav_path_lateral_ratio=DEFAULT_NAV_PATH_LATERAL_RATIO,
 ):
     height, width = mask.shape
-    start_x = int(min(max(vehicle_center[0], 0), width - 1))
-    start_y = int(min(max(vehicle_center[1], 0), height - 1))
+    start_x = int(np.clip(vehicle_center[0], 0, width - 1))
+    start_y = int(np.clip(vehicle_center[1], 0, height - 1))
     straight_x = start_x
     straight_path_bias = max(0.0, float(straight_path_bias))
     nav_corridor_width = max(0, int(nav_corridor_width))
     nav_path_offset_px = int(nav_path_offset_px)
-    nav_path_lateral_ratio = float(min(max(nav_path_lateral_ratio, -1.0), 1.0))
+    nav_path_lateral_ratio = float(
+        np.clip(nav_path_lateral_ratio, -1.0, 1.0)
+    )
     corridor_half_width = nav_corridor_width // 2
-
-    runs_by_row = _row_runs(mask, 0, start_y)
 
     nav_points = []
     current_x = start_x
 
-    if corridor_half_width > 0:
-        corridor_left = max(0, straight_x - corridor_half_width)
-        corridor_right = min(width - 1, straight_x + corridor_half_width)
-
     # At junctions, prefer the run that stays continuous and close to straight ahead.
     for y in range(start_y, -1, -1):
-        runs = runs_by_row.get(y)
+        xs = np.where(mask[y, :] > 0)[0]
+        runs = split_contiguous_runs(xs)
         if not runs:
             continue
 
         if corridor_half_width > 0:
+            corridor_left = max(0, straight_x - corridor_half_width)
+            corridor_right = min(width - 1, straight_x + corridor_half_width)
             corridor_runs = [
-                run for run in runs
-                if run[1] >= corridor_left and run[0] <= corridor_right
+                run
+                for run in runs
+                if int(run[-1]) >= corridor_left and int(run[0]) <= corridor_right
             ]
             if corridor_runs:
                 runs = corridor_runs
 
-        if len(runs) == 1:
-            left, right = runs[0]
-        else:
-            best = None
-            for left_c, right_c in runs:
-                score = (_distance_to_run(current_x, left_c, right_c)
-                         + straight_path_bias
-                         * _distance_to_run(straight_x, left_c, right_c))
-                if best is None or score < best[0]:
-                    best = (score, left_c, right_c)
-            _, left, right = best
+        def distance_to_run(x, left, right):
+            if left <= x <= right:
+                return 0.0
+            return float(min(abs(x - left), abs(x - right)))
 
+        def run_score(run):
+            left = int(run[0])
+            right = int(run[-1])
+            continuity_error = distance_to_run(current_x, left, right)
+            straight_error = distance_to_run(straight_x, left, right)
+            return continuity_error + straight_path_bias * straight_error
+
+        selected_run = min(runs, key=run_score)
+        left = int(selected_run[0])
+        right = int(selected_run[-1])
         preferred_x = (
             current_x + straight_path_bias * straight_x
         ) / (1.0 + straight_path_bias)
         run_half_width = max(0.0, (right - left) / 2.0)
         offset_x = nav_path_offset_px + nav_path_lateral_ratio * run_half_width
-        current_x = int(min(max(round(preferred_x + offset_x), left), right))
+        current_x = int(np.clip(round(preferred_x + offset_x), left, right))
         nav_points.append((current_x, y))
 
     return nav_points

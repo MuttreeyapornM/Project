@@ -1,6 +1,6 @@
 #---------------------env activate-------------------
 windows : myenv\Scripts\activate
-Linux : source myenv/bin/activate
+Linux : source venv/bin/activate
 for main folder: source venv/bin/activate
 
 source /opt/ros/foxy/setup.bash
@@ -515,7 +515,7 @@ python sep_com_combined_timing.py \
 
  # KR ZOO
 
-python saty4.py \
+python saty5.py \
     --front_cam 0 \
     --left_cam 4 \
     --rear_cam 2 \
@@ -542,6 +542,10 @@ python saty4.py \
     --save_output \
     --output zoo22 \
     
+
+
+python saty5.py \
+    --show_preview
 
 
 # แก้ไขให้ไปทางตรงมากกว่าจะไปทางแยก
@@ -650,3 +654,52 @@ python zoo_detect.py \
     --vehicle_height 300 \
     --cmd_vel_topic /cmd_vel_3 \
     --show_preview
+
+
+cd ~/model/main
+source /opt/rps/foxy/set.bash
+./venv/bin/python saty5.py \
+    --front_cam 0 \
+    --left_cam 4 \
+    --rear_cam 2 \
+    --right_cam 6 \
+    --dataset custom \
+    --ckpt ./checkpoints_zoo/best27000.pth \
+    --enable_ros2 \
+    --cmd_vel_publish_hz 20 \
+    --fp16 --async_capture \
+    --model_input_width 640 \
+    --model_input_height 360 \
+    --vehicle_width 200 \
+    --vehicle_height 300 \
+    --lookahead_distance 150 \
+    --target_lookahead_m 4.0 \
+    --stats_every 5 \
+    --show_preview
+
+    python saty5.py \
+    --front_cam 0 \
+    --left_cam 4 \
+    --rear_cam 2 \
+    --right_cam 6 \
+    --dataset custom \
+    --ckpt ./checkpoints_zoo/best27000.pth \
+    --enable_ros2 \
+    --cmd_vel_publish_hz 20 \
+    --fp16 \
+    --async_capture \
+    --model_input_width 640 \
+    --model_input_height 360 \
+    --vehicle_width 200 \
+    --vehicle_height 300 \
+    --lookahead_distance 150 \
+    --target_lookahead_m 4.0 \
+    --steering_filter_alpha 0.55 \
+    --steering_deadband_deg 0.2 \
+    --steering_max_rate_deg_s 60 \
+    --spline_curvature_threshold 0.3 \
+    --straight_linear_x 1.5 \
+    --curved_linear_x 1.0 \
+    --show_preview \
+    --save_output \
+    --output zoo22 \

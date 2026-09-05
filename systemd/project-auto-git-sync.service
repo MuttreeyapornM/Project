@@ -1,0 +1,7 @@
+[Unit]
+Description=Auto commit and push /home/inc/model/main to GitHub
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/inc/model/main
+ExecStart=/home/inc/model/main/scripts/auto_git_sync.sh

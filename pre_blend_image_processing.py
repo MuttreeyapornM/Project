@@ -277,42 +277,25 @@ class ImageStitcher:
         G[nz] = distToB[nz] / denominator[nz]
 
         if key is not None:
-            # Cache the blend weights as FIXED POINT, pre-expanded to 3 channels.
-            #
-            # The float32 merge cost 10.5 ms per corner (42 ms/frame over four)
-            # because it converted both crops to float32, did two float
-            # multiplies and an add, then converted back -- six full-array
-            # passes. In 7-bit fixed point the whole blend stays in uint16:
-            # 255*128 + 255*128 = 65280 < 65535, so it cannot overflow, and one
-            # right shift replaces the final conversion.
-            #
-            # Measured 1.38 ms per corner, 7.6x faster, with a maximum
-            # difference of 1 intensity level against the float32 result and
-            # nothing differing by more than 1.
-            Gq = np.clip(np.round(G * ImageStitcher.BLEND_Q), 0,
-                         ImageStitcher.BLEND_Q).astype(np.uint16)
-            Gq = np.repeat(Gq[:, :, None], 3, axis=2)
-            GqB = (ImageStitcher.BLEND_Q - Gq).astype(np.uint16)
-            ImageStitcher._weight_cache[key] = (G, overlapMask, Gq, GqB)
+            # Pre-expand to 3 channels once so merge() does not rebuild the
+            # broadcast and the (1 - G) complement on every frame.
+            GA = np.repeat(G[:, :, None], 3, axis=2).astype(np.float32)
+            ImageStitcher._weight_cache[key] = (G, overlapMask, GA, 1.0 - GA)
 
         return G, overlapMask
 
 
 
-    # Fixed-point blend scale. 128 keeps the whole accumulation inside uint16.
-    BLEND_Q = 128
-    BLEND_SHIFT = 7
-
     @staticmethod
     def merge(imA, imB, G, key=None):
-        """Blend two crops. With `key`, uses the cached fixed-point weights."""
+        """Blend two crops. With `key`, reuses the pre-expanded weights."""
         if key is not None:
             hit = ImageStitcher._weight_cache.get(key)
             if hit is not None and len(hit) == 4:
-                Gq, GqB = hit[2], hit[3]
-                return (
-                    (imA.astype(np.uint16) * Gq + imB.astype(np.uint16) * GqB)
-                    >> ImageStitcher.BLEND_SHIFT
+                GA, GB = hit[2], hit[3]
+                return cv2.add(
+                    cv2.multiply(imA.astype(np.float32), GA),
+                    cv2.multiply(imB.astype(np.float32), GB),
                 ).astype(np.uint8)
         G_expanded = np.expand_dims(G, axis=-1)
         return (imA * G_expanded + imB * (1 - G_expanded)).astype(np.uint8)
@@ -384,28 +367,28 @@ class ImageStitcher:
 
         # รวมภาพซ้ายบน
         G0, M0 = ImageStitcher.get_weight_mask_matrix(ImageStitcher.FI(front), ImageStitcher.LI(left))
-        merged_image_LT = ImageStitcher.merge(ImageStitcher.FI(front), ImageStitcher.LI(left), G0)
+        merged_image_LT = ImageStitcher.merge(ImageStitcher.FI(front, key="LT"), ImageStitcher.LI(left), G0)
         threading.Thread(target=save_image, args=(merged_image_LT, "out_Section_Images/merged_FI_LI_is_LT.png")).start()
 
         # รวมภาพขวาบน
         threading.Thread(target=save_image, args=(ImageStitcher.FII(front), "out_Section_Images/FII_front.png")).start()
         threading.Thread(target=save_image, args=(ImageStitcher.RII(right), "out_Section_Images/RII_right.png")).start()
         G1, M1 = ImageStitcher.get_weight_mask_matrix(ImageStitcher.FII(front), ImageStitcher.RII(right))
-        merged_image_RT = ImageStitcher.merge(ImageStitcher.FII(front), ImageStitcher.RII(right), G1)
+        merged_image_RT = ImageStitcher.merge(ImageStitcher.FII(front, key="RT"), ImageStitcher.RII(right), G1)
         threading.Thread(target=save_image, args=(merged_image_RT, "out_Section_Images/merged_FI_RII_is_RT.png")).start()
 
         # รวมภาพซ้ายล่าง
         threading.Thread(target=save_image, args=(ImageStitcher.BIII(back), "out_Section_Images/BIII_back.png")).start()
         threading.Thread(target=save_image, args=(ImageStitcher.LIII(left), "out_Section_Images/LIII_left.png")).start()
         G2, M2 = ImageStitcher.get_weight_mask_matrix(ImageStitcher.BIII(back), ImageStitcher.LIII(left))
-        merged_image_LB = ImageStitcher.merge(ImageStitcher.BIII(back), ImageStitcher.LIII(left), G2)
+        merged_image_LB = ImageStitcher.merge(ImageStitcher.BIII(back, key="LB"), ImageStitcher.LIII(left), G2)
         threading.Thread(target=save_image, args=(merged_image_LB, "out_Section_Images/merged_BIII_LIII_is_LB.png")).start()
 
         # รวมภาพขวาล่าง
         threading.Thread(target=save_image, args=(ImageStitcher.BIV(back), "out_Section_Images/BIV_back.png")).start()
         threading.Thread(target=save_image, args=(ImageStitcher.RIV(right), "out_Section_Images/RIV_right.png")).start()
         G3, M3 = ImageStitcher.get_weight_mask_matrix(ImageStitcher.BIV(back), ImageStitcher.RIV(right))
-        merged_image_RB = ImageStitcher.merge(ImageStitcher.BIV(back), ImageStitcher.RIV(right), G3)
+        merged_image_RB = ImageStitcher.merge(ImageStitcher.BIV(back, key="RB"), ImageStitcher.RIV(right), G3)
         threading.Thread(target=save_image, args=(merged_image_RB, "out_Section_Images/merged_BIV_RIV_is_RB.png")).start()
 
         # บรรจุภาพที่ไม่ได้ merge (FM, BM, LM, RM)
@@ -445,19 +428,19 @@ class ImageStitcher:
 
         # รวมภาพซ้ายบน
         G0, M0 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.FI(front), ImageStitcher.LI(left), key="LT")
-        merged_image_LT = ImageStitcher.merge(ImageStitcher.FI(front), ImageStitcher.LI(left), G0, key="LT")
+        merged_image_LT = ImageStitcher.merge(ImageStitcher.FI(front), ImageStitcher.LI(left), G0)
 
         # รวมภาพขวาบน
         G1, M1 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.FII(front), ImageStitcher.RII(right), key="RT")
-        merged_image_RT = ImageStitcher.merge(ImageStitcher.FII(front), ImageStitcher.RII(right), G1, key="RT")
+        merged_image_RT = ImageStitcher.merge(ImageStitcher.FII(front), ImageStitcher.RII(right), G1)
 
         # รวมภาพซ้ายล่าง
         G2, M2 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.BIII(back), ImageStitcher.LIII(left), key="LB")
-        merged_image_LB = ImageStitcher.merge(ImageStitcher.BIII(back), ImageStitcher.LIII(left), G2, key="LB")
+        merged_image_LB = ImageStitcher.merge(ImageStitcher.BIII(back), ImageStitcher.LIII(left), G2)
 
         # รวมภาพขวาล่าง
         G3, M3 = ImageStitcher.get_weight_mask_matrix_liverun(ImageStitcher.BIV(back), ImageStitcher.RIV(right), key="RB")
-        merged_image_RB = ImageStitcher.merge(ImageStitcher.BIV(back), ImageStitcher.RIV(right), G3, key="RB")
+        merged_image_RB = ImageStitcher.merge(ImageStitcher.BIV(back), ImageStitcher.RIV(right), G3)
 
         # บรรจุภาพที่ไม่ได้ merge (FM, BM, LM, RM)
         final_merged_image = np.zeros_like(front)

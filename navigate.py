@@ -122,8 +122,71 @@ class BEVProcessor:
             cam_id: self.load_calibration_data(cam_id) for cam_id in video_paths.keys()
         }
 
-        # Check if CUDA is available
-        self.cuda_available = cv2.cuda.getCudaEnabledDeviceCount() > 0
+        # The cameras are bolted to the vehicle and the homographies are
+        # fixed, so undistort + rotate + homography is a FIXED pixel mapping.
+        # Build it once as a single remap lookup table instead of rebuilding
+        # ~7 MB of correction maps per camera per frame. Measured on the
+        # Jetson AGX Xavier: 4 cameras 252 ms -> 48 ms.
+        # See docs/09-hardware/BEV_Benchmark_Xavier_2026-09-05.md
+        self.maps = {cam: self._build_maps(cam) for cam in video_paths}
+
+    def _build_maps(self, cameraID):
+        """Precompute two LUTs per camera.
+
+        "und": undistorted view (rotated 180 for rear/right, matching the old
+               cv2.undistort + cv2.rotate output).
+        "bev": undistort + rotate + homography composed into ONE map, so the
+               BEV image comes from a single cv2.remap with a single
+               resampling instead of undistort followed by warpPerspective.
+        """
+        CAP_W, CAP_H = 1280, 720
+        calib = self.calibration_data[cameraID]
+        K = np.asarray(calib["camera_matrix"], dtype=np.float64)
+        dist = np.asarray(calib["dist_coeffs"], dtype=np.float64)
+        H = np.asarray(calib["homography"], dtype=np.float64)
+
+        # Same K as new camera matrix == cv2.undistort's default behaviour.
+        m1, m2 = cv2.initUndistortRectifyMap(
+            K, dist, None, K, (CAP_W, CAP_H), cv2.CV_32FC1
+        )
+
+        rotated = cameraID in ("rear", "right")
+
+        # --- map for the undistorted output ---
+        if rotated:
+            # rotate180(remap(img, m)) == remap(img, m flipped in both axes)
+            u1 = np.ascontiguousarray(m1[::-1, ::-1])
+            u2 = np.ascontiguousarray(m2[::-1, ::-1])
+        else:
+            u1, u2 = m1, m2
+        und_map = cv2.convertMaps(u1, u2, cv2.CV_16SC2)
+
+        # --- composed BEV map ---
+        Hinv = np.linalg.inv(H)
+        us, vs = np.meshgrid(
+            np.arange(self.map_width, dtype=np.float64),
+            np.arange(self.map_height, dtype=np.float64),
+        )
+        denom = Hinv[2, 0] * us + Hinv[2, 1] * vs + Hinv[2, 2]
+        x = (Hinv[0, 0] * us + Hinv[0, 1] * vs + Hinv[0, 2]) / denom
+        y = (Hinv[1, 0] * us + Hinv[1, 1] * vs + Hinv[1, 2]) / denom
+        if rotated:
+            # H was calibrated against the ROTATED undistorted image; undo the
+            # rotation before looking up the undistort map
+            x = (CAP_W - 1) - x
+            y = (CAP_H - 1) - y
+        x = x.astype(np.float32)
+        y = y.astype(np.float32)
+
+        # compose: sample the undistort maps at the homography's source coords;
+        # points outside the camera image get -1 -> remap paints them black
+        bx = cv2.remap(m1, x, y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=-1)
+        by = cv2.remap(m2, x, y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=-1)
+        bev_map = cv2.convertMaps(bx, by, cv2.CV_16SC2)
+
+        return {"und": und_map, "bev": bev_map}
 
     def initialize_video_capture(self, path):
         cap = cv2.VideoCapture(path)
@@ -143,42 +206,23 @@ class BEVProcessor:
         fs.release()
         return data
 
-    def process_image(self, image, cameraID):
+    def process_image(self, image, cameraID, want_undistorted=True):
+        """Return (undistorted, bev, proc_time).
+
+        One cv2.remap per output instead of cv2.undistort + cv2.warpPerspective.
+        The old cv2.cuda.undistort branch has been removed: that function does
+        not exist in OpenCV's Python bindings and would raise AttributeError on
+        a CUDA-enabled build. A CUDA build can run these same LUTs through
+        cv2.cuda.remap, which does exist.
+        """
         start_time = time.time()
-        calib = self.calibration_data[cameraID]
-        camera_matrix, dist_coeffs, H = calib["camera_matrix"], calib["dist_coeffs"], calib["homography"]
-
-        # Use CUDA for undistortion if available
-        if self.cuda_available:
-            gpu_image = cv2.cuda_GpuMat()
-            gpu_image.upload(image)
-            gpu_camera_matrix = cv2.cuda_GpuMat()
-            gpu_camera_matrix.upload(camera_matrix)
-            gpu_dist_coeffs = cv2.cuda_GpuMat()
-            gpu_dist_coeffs.upload(dist_coeffs)
-            # Perform GPU-based undistortion
-            gpu_undistorted = cv2.cuda.undistort(gpu_image, gpu_camera_matrix, gpu_dist_coeffs)
-            img_src_undistorted = gpu_undistorted.download()
-        else:
-            # Use CPU if CUDA is not available
-            img_src_undistorted = cv2.undistort(image, camera_matrix, dist_coeffs)
-
-        if cameraID in ["rear", "right"]:
-            img_src_undistorted = cv2.rotate(img_src_undistorted, cv2.ROTATE_180)
-
-        # Use CUDA for perspective warping if available
-        if self.cuda_available:
-            gpu_undistorted = cv2.cuda_GpuMat()
-            gpu_undistorted.upload(img_src_undistorted)
-            gpu_homography = cv2.cuda_GpuMat()
-            gpu_homography.upload(H)
-            # Perform GPU-based perspective warping
-            gpu_warped = cv2.cuda.warpPerspective(gpu_undistorted, gpu_homography, (self.map_width, self.map_height))
-            warped = gpu_warped.download()
-        else:
-            # Use CPU if CUDA is not available
-            warped = cv2.warpPerspective(img_src_undistorted, H, (self.map_width, self.map_height))
-
+        maps = self.maps[cameraID]
+        warped = cv2.remap(image, maps["bev"][0], maps["bev"][1], cv2.INTER_LINEAR)
+        img_src_undistorted = None
+        if want_undistorted:
+            img_src_undistorted = cv2.remap(
+                image, maps["und"][0], maps["und"][1], cv2.INTER_LINEAR
+            )
         proc_time = time.time() - start_time
         return img_src_undistorted, warped, proc_time
 
@@ -418,6 +462,15 @@ def main():
 
     if opts.ckpt and os.path.isfile(opts.ckpt):
         state_dict = torch.load(opts.ckpt, map_location=torch.device('cpu'), weights_only=False)
+        # Accept either a bare state_dict or a full training checkpoint
+        # ({cur_itrs, model_state, optimizer_state, scheduler_state, best_score}),
+        # which is what checkpoints/iter_*.pth actually contains. Previously only
+        # the bare form worked, hence the separate clean_weight.py step.
+        if isinstance(state_dict, dict) and "model_state" in state_dict:
+            print("  training checkpoint detected; using [model_state]",
+                  "iter", state_dict.get("cur_itrs"),
+                  "best_score", state_dict.get("best_score"))
+            state_dict = state_dict["model_state"]
         model.load_state_dict(state_dict)
         model = nn.DataParallel(model)
         model.to(device)

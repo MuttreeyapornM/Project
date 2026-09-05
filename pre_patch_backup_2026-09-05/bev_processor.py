@@ -27,8 +27,6 @@ except ImportError:
     total_w, total_h = 1280, 720
     BEV_AVAILABLE = False
 
-CAP_W, CAP_H = 1280, 720
-
 
 class BEVProcessor:
     def __init__(
@@ -48,15 +46,22 @@ class BEVProcessor:
         self.map_height = map_height if map_height else total_h
         self.caps = {k: self._open_cap(v) for k, v in video_paths.items()}
         self.calibration_data = {cam: self._load_calib(cam) for cam in video_paths}
-        # The cameras are rigidly mounted, so undistortion and the BEV homography
-        # are fixed geometry. Build the remap lookup tables ONCE here instead of
-        # letting cv2.undistort rebuild them on every frame (~40 ms/camera).
-        self.maps = {cam: self._build_maps(cam) for cam in video_paths}
+        if torch is not None:
+            self.torch_device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+        else:
+            self.torch_device = None
+        self.cuda_available = (
+            torch is not None and torch.cuda.is_available() and KORNIA_AVAILABLE
+        )
+        self._H_tensors = {}
+        self._gpu_lock = threading.Lock()
 
     def _open_cap(self, path):
         cap = cv2.VideoCapture(path)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         return cap
 
     def _load_calib(self, cameraID):
@@ -76,93 +81,64 @@ class BEVProcessor:
         fs.release()
         return data
 
-    def _build_maps(self, cameraID):
-        """Precompute two LUTs per camera.
+    def _get_H_tensor(self, cameraID):
+        if cameraID not in self._H_tensors:
+            H = self.calibration_data[cameraID]["homography"]
+            self._H_tensors[cameraID] = (
+                torch.from_numpy(H).unsqueeze(0).float().to(self.torch_device)
+            )
+        return self._H_tensors[cameraID]
 
-        "und": undistorted view (rotated 180 for rear/right, matching the old
-               cv2.undistort + cv2.rotate output).
-        "bev": undistort + rotate + homography composed into ONE map, so the
-               BEV image is produced by a single cv2.remap with a single
-               resampling instead of undistort followed by warpPerspective.
-        """
+    def _warp_gpu(self, image, cameraID):
+        with self._gpu_lock:
+            img_t = (
+                torch.from_numpy(image)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .float()
+                .to(self.torch_device)
+            )
+            with torch.no_grad():
+                out = kornia.geometry.transform.warp_perspective(
+                    img_t,
+                    self._get_H_tensor(cameraID),
+                    dsize=(self.map_height, self.map_width),
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+            return (
+                out.squeeze(0)
+                .permute(1, 2, 0)
+                .clamp(0, 255)
+                .byte()
+                .cpu()
+                .numpy()
+            )
+
+    def process_image(self, image, cameraID):
         calib = self.calibration_data[cameraID]
-        K = np.asarray(calib["camera_matrix"], dtype=np.float64)
-        dist = np.asarray(calib["dist_coeffs"], dtype=np.float64)
-        H = np.asarray(calib["homography"], dtype=np.float64)
-
-        # Float maps: for undistorted pixel (u,v), the source pixel is
-        # (m1[v,u], m2[v,u]). Same K as new camera matrix = cv2.undistort default.
-        m1, m2 = cv2.initUndistortRectifyMap(
-            K, dist, None, K, (CAP_W, CAP_H), cv2.CV_32FC1
+        undis = cv2.undistort(image, calib["camera_matrix"], calib["dist_coeffs"])
+        if cameraID in ["rear", "right"]:
+            undis = cv2.rotate(undis, cv2.ROTATE_180)
+        warped = (
+            self._warp_gpu(undis, cameraID)
+            if self.cuda_available
+            else cv2.warpPerspective(
+                undis, calib["homography"], (self.map_width, self.map_height)
+            )
         )
-
-        rotated = cameraID in ("rear", "right")
-
-        # --- map for the undistorted output ---
-        if rotated:
-            # rotate180(remap(img, m)) == remap(img, m flipped in both axes)
-            u1 = np.ascontiguousarray(m1[::-1, ::-1])
-            u2 = np.ascontiguousarray(m2[::-1, ::-1])
-        else:
-            u1, u2 = m1, m2
-        und_map = cv2.convertMaps(u1, u2, cv2.CV_16SC2)
-
-        # --- composed BEV map ---
-        # BEV output grid -> (rotated) undistorted image coords via H^-1
-        Hinv = np.linalg.inv(H)
-        us, vs = np.meshgrid(
-            np.arange(self.map_width, dtype=np.float64),
-            np.arange(self.map_height, dtype=np.float64),
-        )
-        denom = Hinv[2, 0] * us + Hinv[2, 1] * vs + Hinv[2, 2]
-        x = (Hinv[0, 0] * us + Hinv[0, 1] * vs + Hinv[0, 2]) / denom
-        y = (Hinv[1, 0] * us + Hinv[1, 1] * vs + Hinv[1, 2]) / denom
-        if rotated:
-            # H was calibrated against the rotated undistorted image; undo the
-            # rotation before looking up the undistort map
-            x = (CAP_W - 1) - x
-            y = (CAP_H - 1) - y
-        x = x.astype(np.float32)
-        y = y.astype(np.float32)
-
-        # compose: sample the undistort maps at the homography's source coords;
-        # points outside the camera image get -1 -> remap paints them black
-        bx = cv2.remap(
-            m1, x, y, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=-1,
-        )
-        by = cv2.remap(
-            m2, x, y, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=-1,
-        )
-        bev_map = cv2.convertMaps(bx, by, cv2.CV_16SC2)
-
-        return {"und": und_map, "bev": bev_map}
-
-    def process_image(self, image, cameraID, want_undistorted=True):
-        """Return (undistorted, bev).
-
-        The undistorted view is only used for the debug display grid, so when
-        that is off we skip its remap entirely -- roughly a third of the
-        per-camera warping cost for an image the navigation code never reads.
-        """
-        bev_map = self.maps[cameraID]["bev"]
-        warped = cv2.remap(image, bev_map[0], bev_map[1], cv2.INTER_LINEAR)
-        undis = None
-        if want_undistorted:
-            und_map = self.maps[cameraID]["und"]
-            undis = cv2.remap(image, und_map[0], und_map[1], cv2.INTER_LINEAR)
         return undis, warped
 
-    def grab_frame(self, cam_id, cap, images, warped_list, idx, want_undistorted=True):
+    def grab_frame(self, cam_id, cap, images, warped_list, idx):
         ret, frame = cap.read()
         if not ret:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = cap.read()
             if not ret:
                 return False
-        undis, warped = self.process_image(frame, cam_id, want_undistorted)
-        images[idx] = undis if undis is not None else True  # presence marker
+        undis, warped = self.process_image(frame, cam_id)
+        images[idx] = undis
         warped_list[idx] = warped
         return True
 
@@ -172,8 +148,7 @@ class BEVProcessor:
         warped = [None] * len(self.caps)
         threads = [
             threading.Thread(
-                target=self.grab_frame,
-                args=(cam_id, cap, images, warped, i, include_display),
+                target=self.grab_frame, args=(cam_id, cap, images, warped, i)
             )
             for i, (cam_id, cap) in enumerate(self.caps.items())
         ]
