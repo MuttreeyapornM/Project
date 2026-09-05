@@ -51,10 +51,6 @@ else
   log "created commit: $commit_message"
 fi
 
-if git_auto ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-  git_auto pull --rebase origin "$BRANCH"
-fi
-
 if [ "$(git_auto rev-list --count HEAD 2>/dev/null || echo 0)" -eq 0 ]; then
   log "no commits to push"
   exit 0
@@ -67,5 +63,12 @@ if git_auto rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
   fi
 fi
 
-git_auto push -u origin "$BRANCH"
+if git_auto ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  git_auto pull --rebase origin "$BRANCH"
+fi
+
+if ! git_auto push -u origin "$BRANCH"; then
+  log "push failed; configure non-interactive GitHub credentials for systemd"
+  exit 1
+fi
 log "pushed to origin/$BRANCH"
