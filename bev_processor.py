@@ -15,9 +15,17 @@ except ImportError:
     KORNIA_AVAILABLE = False
 
 try:
-    from capture_settings import configure_capture
+    from capture_settings import configure_capture, is_camera_source
 except ImportError:  # keep the module importable if the helper is absent
     configure_capture = None
+    is_camera_source = None
+
+try:
+    import camera_grabber
+    from camera_grabber import CameraGrabber
+except ImportError:
+    camera_grabber = None
+    CameraGrabber = None
 
 try:
     from image_processing import ImageAdjuster, ImageStitcher
@@ -52,6 +60,13 @@ class BEVProcessor:
         self.map_width = map_width if map_width else total_w
         self.map_height = map_height if map_height else total_h
         self.caps = {k: self._open_cap(v) for k, v in video_paths.items()}
+        # Live cameras get a grabber thread so the driver queue cannot back up.
+        # Video files are left alone: a grabber would race through the file.
+        self.grabbers = {}
+        if CameraGrabber is not None and not camera_grabber.DISABLED:
+            for k, v in video_paths.items():
+                if is_camera_source is not None and is_camera_source(v):
+                    self.grabbers[k] = CameraGrabber(self.caps[k], name=k).start()
         self.calibration_data = {cam: self._load_calib(cam) for cam in video_paths}
         # The cameras are rigidly mounted, so undistortion and the BEV homography
         # are fixed geometry. Build the remap lookup tables ONCE here instead of
@@ -165,12 +180,20 @@ class BEVProcessor:
         return undis, warped
 
     def grab_frame(self, cam_id, cap, images, warped_list, idx, want_undistorted=True):
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
+        grabber = self.grabbers.get(cam_id)
+        if grabber is not None:
+            # Newest frame, never a stale queue entry.
+            ret, frame = grabber.read()
             if not ret:
                 return False
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                # Video-file source: loop back to the start.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    return False
         undis, warped = self.process_image(frame, cam_id, want_undistorted)
         images[idx] = undis if undis is not None else True  # presence marker
         warped_list[idx] = warped
@@ -228,6 +251,17 @@ class BEVProcessor:
                 return merged, np.vstack((top, bottom))
             return merged, None
         return None, None
+
+    def release(self):
+        """Stop grabber threads and release the captures."""
+        for g in self.grabbers.values():
+            g.release()
+        self.grabbers = {}
+        for cap in self.caps.values():
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     def simple_stitch(self, warped_images):
         result = np.zeros((self.map_height, self.map_width, 3), dtype=np.uint8)
