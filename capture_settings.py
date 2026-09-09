@@ -70,6 +70,13 @@ def configure_capture(cap, path, width, height, verbose=True):
 
     if camera:
         cap.set(cv2.CAP_PROP_FPS, CAP_FPS)
+        # Keep the driver queue shallow. cap.read() returns the OLDEST queued
+        # frame, so a deep queue puts the display permanently behind reality by
+        # queue_depth / fps. live_bev.py already sets this; the driving path
+        # never did, which is why the monitor lags. Not every V4L2 backend
+        # honours it, so camera_grabber.py bounds the latency properly - this
+        # just reduces how much there is to drain.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         got = fourcc_name(cap)
         if verbose:
             actual = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
