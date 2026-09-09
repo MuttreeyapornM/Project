@@ -25,6 +25,7 @@ from ros_point_publisher import PathPublisher
 # Import needed modules from image_processing 
 # Note: You'll need to make sure these modules are properly imported
 from image_processing import LuminanceBalancer, ImageStitcher, ImageAdjuster
+from capture_settings import configure_capture
 from param_settings import img_car, Car_dst_points, total_w, total_h
 
 def get_argparser():
@@ -52,7 +53,13 @@ def get_argparser():
     parser.add_argument("--skip_frames", type=int, default=1,
                       help="process every n-th frame")
     parser.add_argument("--show_preview", action='store_true', default=True,
-                      help="show video preview during processing")
+                      help="show video preview during processing (on by default)")
+    parser.add_argument("--no_preview", dest="show_preview", action='store_false',
+                      help="disable the preview window. --show_preview defaults to "
+                           "True and action='store_true' can never clear it, so this "
+                           "is the only way to run headless. Use on the vehicle: the "
+                           "preview renders and blits a full-size BEV frame every "
+                           "iteration and needs an X display.")
     
     # Display Options
     parser.add_argument("--display_width", type=int, default=800,
@@ -190,10 +197,9 @@ class BEVProcessor:
 
     def initialize_video_capture(self, path):
         cap = cv2.VideoCapture(path)
-        # Set the frame size to 1280x720
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        return cap
+        # Requests MJPG on live cameras so capture is not held to 10 fps by the
+        # default YUYV negotiation. Video files are left untouched.
+        return configure_capture(cap, path, 1280, 720)
 
     def load_calibration_data(self, cameraID):
         yaml_filename = os.path.join('yaml', f'calibration_data_{cameraID}.yaml')

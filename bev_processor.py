@@ -15,6 +15,11 @@ except ImportError:
     KORNIA_AVAILABLE = False
 
 try:
+    from capture_settings import configure_capture
+except ImportError:  # keep the module importable if the helper is absent
+    configure_capture = None
+
+try:
     from image_processing import ImageAdjuster, ImageStitcher
     from param_settings import Car_dst_points, img_car, total_h, total_w
 
@@ -55,6 +60,11 @@ class BEVProcessor:
 
     def _open_cap(self, path):
         cap = cv2.VideoCapture(path)
+        if configure_capture is not None:
+            # Requests MJPG on live cameras. Without it V4L2 negotiates YUYV,
+            # which caps these USB 2.0 cameras at 10 fps at 720p regardless of
+            # how fast the rest of the pipeline runs. See capture_settings.py.
+            return configure_capture(cap, path, CAP_W, CAP_H)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
         return cap
