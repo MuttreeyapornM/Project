@@ -25,6 +25,9 @@ from ros_point_publisher import PathPublisher
 # Import needed modules from image_processing 
 # Note: You'll need to make sure these modules are properly imported
 from image_processing import LuminanceBalancer, ImageStitcher, ImageAdjuster
+from capture_settings import configure_capture, is_camera_source
+import camera_grabber
+from camera_grabber import CameraGrabber
 from param_settings import img_car, Car_dst_points, total_w, total_h
 
 def get_argparser():
@@ -52,7 +55,13 @@ def get_argparser():
     parser.add_argument("--skip_frames", type=int, default=1,
                       help="process every n-th frame")
     parser.add_argument("--show_preview", action='store_true', default=True,
-                      help="show video preview during processing")
+                      help="show video preview during processing (on by default)")
+    parser.add_argument("--no_preview", dest="show_preview", action='store_false',
+                      help="disable the preview window. --show_preview defaults to "
+                           "True and action='store_true' can never clear it, so this "
+                           "is the only way to run headless. Use on the vehicle: the "
+                           "preview renders and blits a full-size BEV frame every "
+                           "iteration and needs an X display.")
     
     # Display Options
     parser.add_argument("--display_width", type=int, default=800,
@@ -113,6 +122,14 @@ class BEVProcessor:
         self.car = img_car
         # Initialize video capture for each camera
         self.caps = {key: self.initialize_video_capture(path) for key, path in video_paths.items()}
+        # Live cameras get a grabber thread so the driver queue cannot back up
+        # and leave the display running seconds behind reality. Video files are
+        # left alone: a grabber would race through the file.
+        self.grabbers = {}
+        if not camera_grabber.DISABLED:
+            for key, path in video_paths.items():
+                if is_camera_source(path):
+                    self.grabbers[key] = CameraGrabber(self.caps[key], name=key).start()
         self.display_width = display_width
         self.display_height = display_height
         self.map_width = map_width
@@ -190,10 +207,9 @@ class BEVProcessor:
 
     def initialize_video_capture(self, path):
         cap = cv2.VideoCapture(path)
-        # Set the frame size to 1280x720
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        return cap
+        # Requests MJPG on live cameras so capture is not held to 10 fps by the
+        # default YUYV negotiation. Video files are left untouched.
+        return configure_capture(cap, path, 1280, 720)
 
     def load_calibration_data(self, cameraID):
         yaml_filename = os.path.join('yaml', f'calibration_data_{cameraID}.yaml')
@@ -227,12 +243,20 @@ class BEVProcessor:
         return img_src_undistorted, warped, proc_time
 
     def grab_frame(self, cam_id, cap, images, warped_rgba_, processing_times, index):
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
+        grabber = self.grabbers.get(cam_id)
+        if grabber is not None:
+            # Newest frame, never a stale queue entry.
+            ret, frame = grabber.read()
             if not ret:
                 return False
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                # Video-file source: loop back to the start.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    return False
         undistorted, warped, proc_time = self.process_image(frame, cam_id)
         images[index] = undistorted
         warped_rgba_[index] = warped
@@ -278,6 +302,9 @@ class BEVProcessor:
         return None, None
 
     def release(self):
+        for g in self.grabbers.values():
+            g.stop()
+        self.grabbers = {}
         for cap in self.caps.values():
             cap.release()
 
