@@ -63,6 +63,7 @@ class BEVProcessor:
         # Live cameras get a grabber thread so the driver queue cannot back up.
         # Video files are left alone: a grabber would race through the file.
         self.grabbers = {}
+        self.last_capture_ts = None   # perf_counter() of the oldest frame in the last composite
         if CameraGrabber is not None and not camera_grabber.DISABLED:
             for k, v in video_paths.items():
                 if is_camera_source is not None and is_camera_source(v):
@@ -179,13 +180,16 @@ class BEVProcessor:
             undis = cv2.remap(image, und_map[0], und_map[1], cv2.INTER_LINEAR)
         return undis, warped
 
-    def grab_frame(self, cam_id, cap, images, warped_list, idx, want_undistorted=True):
+    def grab_frame(self, cam_id, cap, images, warped_list, idx, want_undistorted=True,
+                   ts_list=None):
         grabber = self.grabbers.get(cam_id)
         if grabber is not None:
             # Newest frame, never a stale queue entry.
-            ret, frame = grabber.read()
+            ret, frame, ts = grabber.read_ts()
             if not ret:
                 return False
+            if ts_list is not None:
+                ts_list[idx] = ts
         else:
             ret, frame = cap.read()
             if not ret:
@@ -203,10 +207,11 @@ class BEVProcessor:
         cam_names = ["Front", "Left", "Rear", "Right"]
         images = [None] * len(self.caps)
         warped = [None] * len(self.caps)
+        ts_list = [None] * len(self.caps)
         threads = [
             threading.Thread(
                 target=self.grab_frame,
-                args=(cam_id, cap, images, warped, i, include_display),
+                args=(cam_id, cap, images, warped, i, include_display, ts_list),
             )
             for i, (cam_id, cap) in enumerate(self.caps.items())
         ]
@@ -214,6 +219,11 @@ class BEVProcessor:
             thread.start()
         for thread in threads:
             thread.join()
+
+        # Age of the composite is set by its OLDEST camera frame. None for
+        # video-file sources, which carry no capture timestamp.
+        stamps = [t for t in ts_list if t is not None]
+        self.last_capture_ts = min(stamps) if len(stamps) == len(self.caps) else None
 
         if all(img is not None for img in images):
             if (

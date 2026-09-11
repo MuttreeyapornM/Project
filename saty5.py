@@ -362,7 +362,12 @@ def get_argparser():
         default=1,
         help="Save one image every N processed frames when --save_images is enabled",
     )
-    parser.add_argument("--fps", type=int, default=15)
+    # Loop pacing. The main loop sleeps to hold this rate. For LIVE driving that
+    # sleep is pure added latency: the grabber threads already pace the loop at
+    # the camera rate, so 0 (unthrottled) is correct. A non-zero value only
+    # makes sense for replaying recorded video at real time.
+    parser.add_argument("--fps", type=int, default=0,
+                        help="cap the main loop at this rate; 0 = unthrottled (default)")
     parser.add_argument(
         "--record_fps",
         type=int,
@@ -542,6 +547,9 @@ def get_argparser():
         help="linear.x command when the spline is more curved",
     )
     parser.add_argument(
+        "--stats_csv", type=str, default="",
+        help="append one row per stats window to this CSV (leaves a record of a run)")
+    parser.add_argument(
         "--stats_every",
         type=float,
         default=5.0,
@@ -657,6 +665,7 @@ class LatestBEVCapture:
         self.include_display = include_display
         self.latest_frame = None
         self.latest_display = None
+        self.latest_ts = None      # capture timestamp of latest_frame's oldest camera
         self.latest_id = 0
         self.running = False
         self.thread = None
@@ -678,6 +687,7 @@ class LatestBEVCapture:
             with self.condition:
                 self.latest_frame = frame
                 self.latest_display = display
+                self.latest_ts = getattr(self.bev_processor, "last_capture_ts", None)
                 self.latest_id += 1
                 self.condition.notify_all()
 
@@ -687,7 +697,7 @@ class LatestBEVCapture:
                 lambda: self.latest_id != last_id or not self.running,
                 timeout=timeout,
             )
-            return self.latest_frame, self.latest_display, self.latest_id
+            return self.latest_frame, self.latest_display, self.latest_id, self.latest_ts
 
     def stop(self):
         self.running = False
@@ -1404,7 +1414,7 @@ def main():
 
     frame_count = 0
     last_capture_id = 0
-    interval = 1.0 / max(opts.fps, 1)
+    interval = (1.0 / opts.fps) if opts.fps > 0 else 0.0
     # render_overlay = opts.show_preview or opts.save_output or opts.save_images
     render_overlay = (
         opts.show_preview
@@ -1435,6 +1445,18 @@ def main():
     stats_every = float(opts.stats_every)
     st = {"wait": 0.0, "process": 0.0, "record": 0.0, "preview": 0.0, "loop": 0.0}
     st_n = 0
+    # Glass-to-command latency: oldest camera frame capture -> command computed
+    # (process_frame publishes /cmd_vel internally, so its return is the
+    # publish instant). This is the number the stopping-distance argument
+    # rests on; FPS is not.
+    st_age = []
+    stats_csv = None
+    if opts.stats_csv:
+        new_file = not os.path.exists(opts.stats_csv)
+        stats_csv = open(opts.stats_csv, "a")
+        if new_file:
+            stats_csv.write("t,fps,loop_ms,wait_ms,process_ms,record_ms,preview_ms,"
+                            "age_p50_ms,age_p95_ms,age_max_ms,n\n")
     st_t0 = time.perf_counter()
     st_bev0 = capture_worker.latest_id if capture_worker is not None else 0
 
@@ -1443,13 +1465,14 @@ def main():
             t_start = time.time()
             _t = time.perf_counter()
             if capture_worker is not None:
-                bev_frame, cam_display, last_capture_id = capture_worker.get_latest(
-                    last_capture_id
+                bev_frame, cam_display, last_capture_id, capture_ts = (
+                    capture_worker.get_latest(last_capture_id)
                 )
             else:
                 bev_frame, cam_display = bev_processor.get_bev_frame(
                     include_display=opts.show_preview
                 )
+                capture_ts = getattr(bev_processor, "last_capture_ts", None)
             st["wait"] += (time.perf_counter() - _t) * 1000.0
             if bev_frame is None:
                 time.sleep(0.01)
@@ -1482,6 +1505,8 @@ def main():
             )
 
             st["process"] += (time.perf_counter() - _t) * 1000.0
+            if capture_ts is not None:
+                st_age.append((time.perf_counter() - capture_ts) * 1000.0)
             _t = time.perf_counter()
 
             if opts.save_output and frame_count % record_every == 0:
@@ -1555,6 +1580,22 @@ def main():
                         f"record {st['record'] / n:5.1f}  "
                         f"preview {st['preview'] / n:5.1f} ms"
                     )
+                    if st_age:
+                        a = sorted(st_age)
+                        p50 = a[len(a) // 2]
+                        p95 = a[min(len(a) - 1, int(len(a) * 0.95))]
+                        line += (f"  |  glass->cmd p50 {p50:6.1f}  p95 {p95:6.1f}  "
+                                 f"max {a[-1]:6.1f} ms")
+                    if stats_csv is not None:
+                        a = sorted(st_age) or [float("nan")]
+                        stats_csv.write(
+                            f"{time.time():.3f},{n / _el:.2f},{loop_ms:.1f},"
+                            f"{st['wait'] / n:.1f},{st['process'] / n:.1f},"
+                            f"{st['record'] / n:.1f},{st['preview'] / n:.1f},"
+                            f"{a[len(a) // 2]:.1f},"
+                            f"{a[min(len(a) - 1, int(len(a) * 0.95))]:.1f},"
+                            f"{a[-1]:.1f},{n}\n")
+                        stats_csv.flush()
                     if capture_worker is not None:
                         produced = capture_worker.latest_id - st_bev0
                         line += (
@@ -1566,10 +1607,12 @@ def main():
                     print(line, flush=True)
                     st = {k: 0.0 for k in st}
                     st_n = 0
+                    st_age = []
                     st_t0 = time.perf_counter()
 
-            elapsed = time.time() - t_start
-            time.sleep(max(0.0, interval - elapsed))
+            if interval > 0.0:
+                elapsed = time.time() - t_start
+                time.sleep(max(0.0, interval - elapsed))
 
     except KeyboardInterrupt:
         print("\nInterrupted by user")

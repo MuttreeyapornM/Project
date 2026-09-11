@@ -56,6 +56,7 @@ class CameraGrabber:
         self.name = str(name)
         self._lock = threading.Lock()
         self._frame = None
+        self._ts = None          # perf_counter() when _frame was retrieved
         self._seq = 0
         self._running = False
         self._thread = None
@@ -83,8 +84,10 @@ class CameraGrabber:
             if not ok or frame is None:
                 self.fail_count += 1
                 continue
+            ts = time.perf_counter()
             with self._lock:
                 self._frame = frame
+                self._ts = ts
                 self._seq += 1
 
     def read(self, timeout=1.0):
@@ -101,6 +104,22 @@ class CameraGrabber:
                     return True, self._frame
             if time.time() >= deadline or not self._running:
                 return False, None
+            time.sleep(0.001)
+
+    def read_ts(self, timeout=1.0):
+        """Like read(), but returns (ok, frame, capture_ts).
+
+        capture_ts is time.perf_counter() at the moment the frame was retrieved
+        from the driver - the earliest point in the pipeline we can timestamp.
+        Everything downstream measures its latency against this.
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self._lock:
+                if self._frame is not None:
+                    return True, self._frame, self._ts
+            if time.time() >= deadline or not self._running:
+                return False, None, None
             time.sleep(0.001)
 
     @property
