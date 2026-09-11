@@ -459,6 +459,9 @@ def get_argparser():
         help="Disable expensive visualization work and favor newest data",
     )
     parser.add_argument("--model", type=str, default="deeplabv3plus_mobilenet", choices=available_models)
+    parser.add_argument("--trt_engine", type=str, default=None,
+                        help="run segmentation from this TensorRT engine instead of PyTorch "
+                             "(build with export_trt.py, check with validate_trt.py)")
     parser.add_argument("--output_stride", type=int, default=16, choices=[8, 16])
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--gpu_id", type=str, default="0")
@@ -639,6 +642,9 @@ def build_model(opts, device):
 
 
 def warmup_model(model, device, opts):
+    if getattr(model, "is_trt", False):
+        model.warmup()
+        return
     if device.type != "cuda":
         return
     infer_w = opts.inference_width if opts.inference_width > 0 else opts.display_width
@@ -1025,15 +1031,19 @@ def process_frame(
                 frame, (infer_w, infer_h), interpolation=cv2.INTER_AREA
             )
 
-    frame_rgb = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
-    input_tensor = transform(PILImage.fromarray(frame_rgb)).unsqueeze(0).to(device)
-    if use_fp16 and device.type == "cuda":
-        input_tensor = input_tensor.half()
+    if getattr(model, "is_trt", False):
+        # TensorRT path: preprocessing runs in torch on the GPU inside infer().
+        pred = model.infer(input_frame).astype(np.int64)
+    else:
+        frame_rgb = cv2.cvtColor(input_frame, cv2.COLOR_BGR2RGB)
+        input_tensor = transform(PILImage.fromarray(frame_rgb)).unsqueeze(0).to(device)
+        if use_fp16 and device.type == "cuda":
+            input_tensor = input_tensor.half()
 
-    with torch.inference_mode():
-        logits = model(input_tensor)
-        pred_gpu = torch.argmax(logits, dim=1)[0]
-        pred = pred_gpu.cpu().numpy().astype(np.int64)
+        with torch.inference_mode():
+            logits = model(input_tensor)
+            pred_gpu = torch.argmax(logits, dim=1)[0]
+            pred = pred_gpu.cpu().numpy().astype(np.int64)
     if pred.shape[:2] != frame.shape[:2]:
         pred = cv2.resize(
             pred.astype(np.uint8),
@@ -1313,6 +1323,11 @@ def main():
         max(1, int(opts.vehicle_height)),
     )
     model, transform, decode_fn = build_model(opts, device)
+    if opts.trt_engine:
+        from trt_segmenter import TRTSegmenter
+        iw, ih = (inference_size if inference_size else (opts.inference_width, opts.inference_height))
+        model = TRTSegmenter(opts.trt_engine, iw, ih, device)
+        print(f"Segmentation runtime: TensorRT engine {opts.trt_engine} ({iw}x{ih})")
     warmup_model(model, device, opts)
 
     ros2_node_real = None
