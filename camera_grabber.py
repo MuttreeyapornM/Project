@@ -41,6 +41,12 @@ import os
 import threading
 import time
 
+try:
+    from jpeg_decoder import is_raw_jpeg as _is_raw_jpeg
+except ImportError:
+    def _is_raw_jpeg(frame):
+        return False
+
 DISABLED = os.environ.get("BEV_DISABLE_GRABBER", "").strip() != ""
 
 
@@ -51,9 +57,15 @@ class CameraGrabber:
     through the file at thread speed rather than following the consumer.
     """
 
-    def __init__(self, cap, name=""):
+    def __init__(self, cap, name="", decoder=None):
         self.cap = cap
         self.name = str(name)
+        # Optional jpeg_decoder.JpegDecoder. When set, the capture is expected to
+        # deliver RAW MJPEG buffers (CAP_PROP_CONVERT_RGB=0) and this thread
+        # decodes them - on the GPU if the decoder is a GPU backend - so the
+        # consumer still receives BGR frames and nothing downstream changes.
+        self.decoder = decoder
+        self.decode_fail = 0
         self._lock = threading.Lock()
         self._frame = None
         self._seq = 0
@@ -83,6 +95,11 @@ class CameraGrabber:
             if not ok or frame is None:
                 self.fail_count += 1
                 continue
+            if self.decoder is not None and _is_raw_jpeg(frame):
+                frame = self.decoder.decode(frame)
+                if frame is None:            # corrupt buffer: keep the last good frame
+                    self.decode_fail += 1
+                    continue
             with self._lock:
                 self._frame = frame
                 self._seq += 1
