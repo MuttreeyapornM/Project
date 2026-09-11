@@ -33,18 +33,86 @@ CAP_FPS = 30
 
 _DISABLE_MJPG = os.environ.get("BEV_DISABLE_MJPG", "").strip() != ""
 
+# Where udev publishes stable, port-derived names for V4L2 devices.
+V4L_DIR = "/dev/v4l"
+
 
 def is_camera_source(path):
     """True when `path` refers to a live V4L2 camera rather than a video file.
 
     MJPG must only be forced on live cameras. Video files carry their own
     codec and setting CAP_PROP_FOURCC on them can break decoding.
+
+    Accepts /dev/v4l/... as well as /dev/video*, so a stable by-path name is
+    still recognised as a camera. Missing this would silently disable MJPG and
+    the grabber thread for anything addressed by stable path.
     """
     if isinstance(path, bool):          # guard: bool is a subclass of int
         return False
     if isinstance(path, int):
         return True
-    return isinstance(path, str) and path.startswith("/dev/video")
+    if not isinstance(path, str):
+        return False
+    return path.startswith("/dev/video") or path.startswith(V4L_DIR + "/")
+
+
+def list_cameras():
+    """Return [(stable_path, /dev/videoN)] for every capture device, sorted.
+
+    Reads /dev/v4l/by-path, which names devices by the USB port they are
+    plugged into rather than by enumeration order.
+    """
+    out = []
+    by_path = os.path.join(V4L_DIR, "by-path")
+    if not os.path.isdir(by_path):
+        return out
+    for name in sorted(os.listdir(by_path)):
+        # Each camera exposes a capture node and a metadata node; keep capture.
+        if not name.endswith("-video-index0"):
+            continue
+        link = os.path.join(by_path, name)
+        out.append((link, os.path.realpath(link)))
+    return out
+
+
+def resolve_camera(spec):
+    """Resolve a camera spec to something cv2.VideoCapture can open.
+
+    Accepts, in order of preference:
+
+      - a stable path      "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.1:1.0-video-index0"
+      - a by-path basename "platform-3610000.usb-usb-0:2.1:1.0-video-index0"
+      - a device path      "/dev/video2"
+      - an integer index   2  or  "2"   (legacy; NOT stable across reboots)
+
+    Stable paths are resolved to their /dev/videoN target, because that is what
+    the V4L2 backend and `is_camera_source` expect.
+
+    WHY: /dev/videoN indices are assigned in enumeration order and move between
+    boots and replugs - observed on this rig going from 0,2,4,7 to 2,4,5,8.
+    With four physically identical cameras there is nothing in the image to say
+    which is which, so a reordering silently applies each camera's homography to
+    the wrong view and the stitch is wrong with no error raised.
+    """
+    if isinstance(spec, int) and not isinstance(spec, bool):
+        return spec
+    if not isinstance(spec, str):
+        return spec
+
+    spec = spec.strip()
+    if spec.isdigit():                      # legacy "--front_cam 2"
+        return int(spec)
+    if spec.startswith("/dev/video"):
+        return spec
+    if spec.startswith(V4L_DIR + "/"):
+        return os.path.realpath(spec)
+
+    candidate = os.path.join(V4L_DIR, "by-path", spec)
+    if os.path.exists(candidate):
+        return os.path.realpath(candidate)
+
+    # Not recognised - hand it back untouched so video files still work.
+    return spec
 
 
 def fourcc_name(cap):
