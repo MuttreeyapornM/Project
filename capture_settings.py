@@ -53,8 +53,12 @@ def fourcc_name(cap):
     return "".join(chr((raw >> (8 * i)) & 0xFF) for i in range(4))
 
 
-def configure_capture(cap, path, width, height, verbose=True):
+def configure_capture(cap, path, width, height, verbose=True, raw_mjpg=False):
     """Apply resolution, and MJPG + frame rate for live cameras.
+
+    raw_mjpg=True asks the backend NOT to decode: read()/retrieve() then return
+    the compressed JPEG buffer (1xN uint8), for a jpeg_decoder.JpegDecoder to
+    decode on the GPU. Only honoured when MJPG was actually negotiated.
 
     Returns the same `cap` so it can be used inline.
     """
@@ -78,13 +82,17 @@ def configure_capture(cap, path, width, height, verbose=True):
         # just reduces how much there is to drain.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         got = fourcc_name(cap)
+        raw = False
+        if raw_mjpg and got == "MJPG":
+            # Hand us the compressed buffer; decode happens in the grabber.
+            raw = bool(cap.set(cv2.CAP_PROP_CONVERT_RGB, 0))
         if verbose:
             actual = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                       int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                       cap.get(cv2.CAP_PROP_FPS))
             if got == "MJPG":
                 print(f"[capture] {path}: MJPG {actual[0]}x{actual[1]} "
-                      f"@ {actual[2]:.0f} fps")
+                      f"@ {actual[2]:.0f} fps" + ("  (raw, GPU decode)" if raw else ""))
             else:
                 print(f"[capture] WARNING {path}: negotiated {got!r}, not "
                       f"MJPG - capture stays capped near 10 fps at 720p")

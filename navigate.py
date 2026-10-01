@@ -28,6 +28,7 @@ from image_processing import LuminanceBalancer, ImageStitcher, ImageAdjuster
 from capture_settings import configure_capture, is_camera_source
 import camera_grabber
 from camera_grabber import CameraGrabber
+from jpeg_decoder import JpegDecoder
 from param_settings import img_car, Car_dst_points, total_w, total_h
 
 def get_argparser():
@@ -121,6 +122,10 @@ class BEVProcessor:
         self.video_paths = video_paths
         self.car = img_car
         # Initialize video capture for each camera
+        # Shared GPU JPEG decoder (see jpeg_decoder.py); None = CPU decode as before.
+        self.jpeg_decoder = None
+        if not camera_grabber.DISABLED and any(is_camera_source(p) for p in video_paths.values()):
+            self.jpeg_decoder = JpegDecoder.probe()
         self.caps = {key: self.initialize_video_capture(path) for key, path in video_paths.items()}
         # Live cameras get a grabber thread so the driver queue cannot back up
         # and leave the display running seconds behind reality. Video files are
@@ -129,7 +134,9 @@ class BEVProcessor:
         if not camera_grabber.DISABLED:
             for key, path in video_paths.items():
                 if is_camera_source(path):
-                    self.grabbers[key] = CameraGrabber(self.caps[key], name=key).start()
+                    self.grabbers[key] = CameraGrabber(
+                        self.caps[key], name=key, decoder=self.jpeg_decoder
+                    ).start()
         self.display_width = display_width
         self.display_height = display_height
         self.map_width = map_width
@@ -209,7 +216,8 @@ class BEVProcessor:
         cap = cv2.VideoCapture(path)
         # Requests MJPG on live cameras so capture is not held to 10 fps by the
         # default YUYV negotiation. Video files are left untouched.
-        return configure_capture(cap, path, 1280, 720)
+        raw = self.jpeg_decoder is not None and self.jpeg_decoder.is_gpu
+        return configure_capture(cap, path, 1280, 720, raw_mjpg=raw)
 
     def load_calibration_data(self, cameraID):
         yaml_filename = os.path.join('yaml', f'calibration_data_{cameraID}.yaml')

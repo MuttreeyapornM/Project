@@ -28,6 +28,11 @@ except ImportError:
     CameraGrabber = None
 
 try:
+    from jpeg_decoder import JpegDecoder
+except ImportError:
+    JpegDecoder = None
+
+try:
     from image_processing import ImageAdjuster, ImageStitcher
     from param_settings import Car_dst_points, img_car, total_h, total_w
 
@@ -59,6 +64,13 @@ class BEVProcessor:
         self.display_height = display_height
         self.map_width = map_width if map_width else total_w
         self.map_height = map_height if map_height else total_h
+        # One JPEG decoder shared by the grabbers, chosen once. When it is a GPU
+        # backend the captures are opened in raw-MJPG mode so the CPU never
+        # touches libjpeg. None means VideoCapture decodes as before.
+        self.jpeg_decoder = None
+        if JpegDecoder is not None and CameraGrabber is not None and not camera_grabber.DISABLED:
+            if any(is_camera_source is not None and is_camera_source(v) for v in video_paths.values()):
+                self.jpeg_decoder = JpegDecoder.probe()
         self.caps = {k: self._open_cap(v) for k, v in video_paths.items()}
         # Live cameras get a grabber thread so the driver queue cannot back up.
         # Video files are left alone: a grabber would race through the file.
@@ -66,7 +78,9 @@ class BEVProcessor:
         if CameraGrabber is not None and not camera_grabber.DISABLED:
             for k, v in video_paths.items():
                 if is_camera_source is not None and is_camera_source(v):
-                    self.grabbers[k] = CameraGrabber(self.caps[k], name=k).start()
+                    self.grabbers[k] = CameraGrabber(
+                        self.caps[k], name=k, decoder=self.jpeg_decoder
+                    ).start()
         self.calibration_data = {cam: self._load_calib(cam) for cam in video_paths}
         # The cameras are rigidly mounted, so undistortion and the BEV homography
         # are fixed geometry. Build the remap lookup tables ONCE here instead of
@@ -79,7 +93,8 @@ class BEVProcessor:
             # Requests MJPG on live cameras. Without it V4L2 negotiates YUYV,
             # which caps these USB 2.0 cameras at 10 fps at 720p regardless of
             # how fast the rest of the pipeline runs. See capture_settings.py.
-            return configure_capture(cap, path, CAP_W, CAP_H)
+            raw = self.jpeg_decoder is not None and self.jpeg_decoder.is_gpu
+            return configure_capture(cap, path, CAP_W, CAP_H, raw_mjpg=raw)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
         return cap
