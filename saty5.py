@@ -30,6 +30,7 @@ from scipy.interpolate import CubicSpline
 from torchvision import transforms as T
 
 import network
+from capture_settings import resolve_camera, list_cameras
 from bev_processor import BEVProcessor, BEV_AVAILABLE, img_car
 from datasets import VOCSegmentation, Cityscapes
 from nav_processing import (
@@ -330,10 +331,16 @@ def get_argparser():
         description="Combined BEV + navigation + ROS2 Twist publisher"
     )
 
-    parser.add_argument("--front_cam", type=int, default=2)
-    parser.add_argument("--left_cam", type=int, default=4)
-    parser.add_argument("--rear_cam", type=int, default=0)
-    parser.add_argument("--right_cam", type=int, default=6)
+    # Accepts an index (legacy, e.g. 2) or a stable /dev/v4l/by-path name.
+    # Indices move between boots; with four identical cameras a reorder silently
+    # applies each homography to the wrong view. Use --list_cameras to get the
+    # stable names. See capture_settings.resolve_camera().
+    parser.add_argument("--front_cam", type=str, default="2")
+    parser.add_argument("--left_cam", type=str, default="4")
+    parser.add_argument("--rear_cam", type=str, default="0")
+    parser.add_argument("--right_cam", type=str, default="6")
+    parser.add_argument("--list_cameras", action="store_true",
+                        help="print the stable by-path name of each camera and exit")
     parser.add_argument("--display_width", type=int, default=800)
     parser.add_argument("--display_height", type=int, default=600)
 
@@ -1278,6 +1285,18 @@ def process_frame(
 
 def main():
     opts = get_argparser().parse_args()
+    if getattr(opts, "list_cameras", False):
+        cams = list_cameras()
+        if not cams:
+            print("No cameras found under /dev/v4l/by-path.")
+            print("Check they are connected: ls /dev/video*")
+        else:
+            print("Stable camera names (survive reboot and replug):\n")
+            for link, target in cams:
+                print(f"  {target}   {link}")
+            print("\nUse the full path, or just the basename, e.g.:")
+            print(f"  --front_cam {cams[0][0]}")
+        return
 
     # ==========================================================
     # LOW LATENCY MODE
@@ -1364,10 +1383,10 @@ def main():
         )
 
     video_paths = {
-        "front": opts.front_cam,
-        "left": opts.left_cam,
-        "rear": opts.rear_cam,
-        "right": opts.right_cam,
+        "front": resolve_camera(opts.front_cam),
+        "left": resolve_camera(opts.left_cam),
+        "rear": resolve_camera(opts.rear_cam),
+        "right": resolve_camera(opts.right_cam),
     }
 
     bev_processor = BEVProcessor(

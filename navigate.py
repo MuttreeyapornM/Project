@@ -25,7 +25,7 @@ from ros_point_publisher import PathPublisher
 # Import needed modules from image_processing 
 # Note: You'll need to make sure these modules are properly imported
 from image_processing import LuminanceBalancer, ImageStitcher, ImageAdjuster
-from capture_settings import configure_capture, is_camera_source
+from capture_settings import configure_capture, is_camera_source, resolve_camera, list_cameras
 import camera_grabber
 from camera_grabber import CameraGrabber
 from jpeg_decoder import JpegDecoder
@@ -37,14 +37,20 @@ def get_argparser():
     # Camera Options
     parser.add_argument("--use_camera", action='store_true', default=False,
                       help="use live camera feed instead of video files")
-    parser.add_argument("--front_cam", type=int, default=2,
-                      help="camera ID for front camera")
-    parser.add_argument("--left_cam", type=int, default=4,
-                      help="camera ID for left camera")
-    parser.add_argument("--rear_cam", type=int, default=0,
-                      help="camera ID for rear camera")
-    parser.add_argument("--right_cam", type=int, default=6,
-                      help="camera ID for right camera")
+    # Accepts an index (legacy, e.g. 2) or a stable /dev/v4l/by-path name.
+    # Indices move between boots; with four identical cameras a reorder silently
+    # applies each homography to the wrong view. Use --list_cameras for the
+    # stable names. See capture_settings.resolve_camera().
+    parser.add_argument("--front_cam", type=str, default="2",
+                      help="front camera: index or /dev/v4l/by-path name")
+    parser.add_argument("--left_cam", type=str, default="4",
+                      help="left camera: index or /dev/v4l/by-path name")
+    parser.add_argument("--rear_cam", type=str, default="0",
+                      help="rear camera: index or /dev/v4l/by-path name")
+    parser.add_argument("--right_cam", type=str, default="6",
+                      help="right camera: index or /dev/v4l/by-path name")
+    parser.add_argument("--list_cameras", action="store_true",
+                      help="print the stable by-path name of each camera and exit")
     
     # Video Options (for non-camera mode)
     parser.add_argument("--input", type=str, default=None,
@@ -469,6 +475,18 @@ def process_bev_frame(bev_frame, model, transform, device, decode_fn, show_mask_
     
 def main():
     opts = get_argparser().parse_args()
+    if getattr(opts, "list_cameras", False):
+        cams = list_cameras()
+        if not cams:
+            print("No cameras found under /dev/v4l/by-path.")
+            print("Check they are connected: ls /dev/video*")
+        else:
+            print("Stable camera names (survive reboot and replug):\n")
+            for link, target in cams:
+                print(f"  {target}   {link}")
+            print("\nUse the full path, or just the basename, e.g.:")
+            print(f"  --front_cam {cams[0][0]}")
+        return
 
     # Set number of classes and decode function based on dataset
     if opts.dataset.lower() == 'voc':
@@ -528,10 +546,10 @@ def main():
 
     if opts.use_camera:
         video_paths = {
-            "front": opts.front_cam,
-            "left": opts.left_cam,
-            "rear": opts.rear_cam,
-            "right": opts.right_cam,
+            "front": resolve_camera(opts.front_cam),
+            "left": resolve_camera(opts.left_cam),
+            "rear": resolve_camera(opts.rear_cam),
+            "right": resolve_camera(opts.right_cam),
         }
         bev_processor = BEVProcessor(
             video_paths,
